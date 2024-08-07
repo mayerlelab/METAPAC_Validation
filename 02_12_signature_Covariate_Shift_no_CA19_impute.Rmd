@@ -1,0 +1,349 @@
+---
+title: "MetaPac"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: '__12 signature TASA (Covariate Shift)__'
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+
+ifelse(!dir.exists(file.path(paste0(here()), "FINAL_RESULTS/TASA/results")), dir.create(file.path(paste0(here()), 
+    "FINAL_RESULTS/TASA/results")), FALSE)
+```
+## impute transform scale function
+```{r}
+ImputeTransformScaleWithTrain <- function(Data,
+                                          Impute = FALSE,
+                                          Transform = FALSE,
+                                          Scaling = FALSE,
+                                          TrainData = NA,
+                                          ScaleType = c("Centering", "Auto", "Range", "Pareto", "Vast", "Level")) {
+  stopifnot(inherits(Data, "data.frame"))
+  validObject(Data)
+
+  ScaleType <- match.arg(ScaleType)
+
+  if (is.data.frame(TrainData)) {
+    TrainData <- metapacR::ImputeTransformScale(TrainData,
+                                      Impute = TRUE,
+                                      Transform = TRUE,
+                                      Scaling = FALSE)
+  }
+
+  ## subset data
+  nCol <- ncol(Data)
+  ## empty data-frame
+  scaleData <- data.frame(matrix(NA, nrow = nrow(Data), ncol = nCol))
+  ## column names to empty dataframe
+  colnames(scaleData) <- colnames(Data)
+
+  for (i in 1:nCol) {
+  ## select metabolite
+  met <- colnames(Data)[[i]]
+
+  if (class(Data[[i]]) %in% c("numeric", "integer")) {
+
+    if (Impute == TRUE) {
+      ## median of data
+      impute <- median(Data[[i]], na.rm = TRUE)
+      ## median imputation
+      Data[is.na(Data[[i]]), i] <- impute
+    }
+    if (Transform == TRUE) {
+      ## transformed data
+      Data[[i]] <- log10(Data[[i]])
+    }
+    if (Scaling == TRUE) {
+      if (is.data.frame(TrainData) && !is.null(TrainData[[met]])) {
+        ## mean of data
+        mean <- mean(TrainData[[met]], na.rm = TRUE)
+        ## min
+        min <- min(TrainData[[met]])
+        ## max
+        max <- max(TrainData[[met]])
+      } else {
+        ## mean of data
+        mean <- mean(Data[[i]], na.rm = TRUE)
+        ## min
+        min <- min(Data[[i]])
+        ## max
+        max <- max(Data[[i]])
+      }
+
+      ## centering
+      if (ScaleType == "Centering") {
+        ## centred data
+        centreData <- Data[[i]] - mean
+        ## sd data
+        sd <- sd(centreData, na.rm = TRUE)
+        
+        scaleData[[met]] <- centreData
+      }
+      ## Auto-scaling
+      else if (ScaleType == "Auto") {
+        ## centred data
+        centreData <- Data[[i]] - mean
+        ## sd data
+        sd <- sd(centreData, na.rm = TRUE)
+        
+        scaleData[[met]] <- centreData / sd
+      }
+      ## range scaling
+      else if (ScaleType == "Range") {
+        scaleData[[met]] <- (Data[[i]] - min) / (max - min)
+      }
+      ## pareto scaling
+      else if (ScaleType == "Pareto") {
+        ## centred data
+        centreData <- Data[[i]] - mean
+        ## sd data
+        sd <- sd(centreData, na.rm = TRUE)
+        
+        scaleData[[met]] <- centreData / sqrt(sd)
+      }
+      ## vast scaling
+      else if (ScaleType == "Vast") {
+        ## centred data
+        centreData <- Data[[i]] - mean
+        ## sd data
+        sd <- sd(centreData, na.rm = TRUE)
+        
+        scaleData[[met]] <- (centreData / mean) * (mean / sd)
+      }
+      ## level scaling
+      else if (ScaleType == "Level") {
+        ## centred data
+        centreData <- Data[[i]] - mean
+        ## sd data
+        sd <- sd(centreData, na.rm = TRUE)
+        
+        scaleData[[met]] <- (centreData) / mean
+      }
+    }
+  }
+
+  scaleData[[met]] <- Data[[i]]
+}
+  return(scaleData)
+}
+```
+
+
+## load TASA metabolon dataset
+```{r}
+metabolon_dat <- readRDS("results/merged_TASA_data.rds")
+```
+
+## load and process metadata
+```{r}
+metadata <- readRDS("../../MetaData/metadata_final/processed_metadata/metadata_flatten_df_cumm_diagnosis.rds")
+
+SAMPLE_ANALYSIS_DATE <- as.Date("20210617", "%Y%m%d")
+
+## process metadata
+metadata <- metadata %>%
+  filter(CPEVENT == "V1 BASELINE") %>%
+  mutate(DM__DMDAT=as.Date(DM__DMDAT, "%Y%m%d")) %>%
+  mutate(SAMPLE_STORAGE=as.numeric(difftime(SAMPLE_ANALYSIS_DATE, DM__DMDAT, units="days"))) %>%
+  dplyr::select(PT, 
+         LB01SDV__LB03, 
+         `LB03__CA19-9_U/ml`, 
+         DM__AGEDIAG,
+         DM__BMI,
+         DM__SEX,
+         SAMPLE_STORAGE, 
+         cummulative_diagnosis) %>%
+  mutate(`LB03__CA19-9_U/ml`=as.numeric(`LB03__CA19-9_U/ml`),
+         DM__BMI=as.numeric(DM__BMI))
+
+metadata <- metadata %>%
+  dplyr::select(PT, LB01SDV__LB03, cummulative_diagnosis, `LB03__CA19-9_U/ml`) %>%
+  rename("CA19_9" = "LB03__CA19-9_U/ml") %>%
+  mutate(Disease_status = ifelse(cummulative_diagnosis == "Pankreaskarzinom", "PDAC", "CP")) 
+
+```
+
+## load TASA metanomics health data
+```{r}
+mh_data <- readxl::read_excel("../../../../METAPAC_data_transfer/Data transfer/MxPool/MetaPac_Prospec_01_2019-08-29_MetaboliteData_MTXH.xlsx",2, skip = 4)
+
+## MH units are ug/dL -> convert it to ug/mL
+for (i in colnames(mh_data)[11:ncol(mh_data)]) {
+    mh_data[[i]] <- mh_data[[i]] * 0.01
+}
+
+id_cols <- c ("LB01SDV__LB03")
+
+mh_data <- mh_data %>%
+    select(ALIQUOT_X03, colnames(mh_data)[11:ncol(mh_data)]) %>%
+    gather("Analyte", "Result_MH", -ALIQUOT_X03) %>%
+    mutate(Analyte = paste0("X",Analyte),
+    ALIQUOT_X03 = as.character(ALIQUOT_X03),
+    LB01SDV__LB03 = as.character(gsub("^.{3}", "", ALIQUOT_X03))) %>%
+    select(-ALIQUOT_X03) %>%
+    #distinct(`LB01=LB03`, .keep_all = TRUE) %>%
+    pivot_wider(names_from = Analyte, values_from = Result_MH)
+
+## merge datasets
+mh_data <-  merge(mh_data, metadata, by = "LB01SDV__LB03")
+```
+
+## impute transform scale datasets
+```{r}
+train_data <- read.table("../../../../METAPAC_data_transfer/Data transfer/Pancreas/PDAC_project_data/PDAC_data/MxP_Pancreas_Panel/Pancreas_Panel_ID_VD1/MxP_Pancreas_Panel_gamma_version_id_data.txt", 
+                    sep = "\t",
+                    header = TRUE)
+
+train_data <- train_data[!train_data$Diagnosis %in% "Pancreatic cancer and chronic pancreatitis",]
+train_data$Disease_status <- ifelse(train_data$PDCA == "yes", "PDAC", "CP")
+
+train_features <-  metapacR::ImputeTransformScale(Data = mh_data,
+                                        Impute = TRUE,
+                                        Transform = TRUE,
+                                        Scaling = TRUE,
+                                        ScaleType = "Auto")
+
+
+
+test_features <- metapacR::ImputeTransformScale(metabolon_dat,
+                                        Impute = TRUE,
+                                        Transform = TRUE,
+                                        Scaling = TRUE,
+                                        ScaleType = "Auto")
+
+saveRDS(test_features, "results/uncorrected_test_df.rds")
+```
+
+## covariate shift correction
+
+```{r}
+matched_indices <- intersect(train_features$LB01SDV__LB03,test_features$LB01SDV__LB03)
+
+matched_train <- train_features %>%
+  filter(LB01SDV__LB03 %in% matched_indices)
+
+matched_test <- test_features %>%
+  filter(LB01SDV__LB03 %in% matched_indices)
+
+# Get column names from the existing data frame
+column_names <- colnames(test_features)
+
+# Create an empty data frame with the same columns
+corrected_test_df <- data.frame(matrix(ncol = length(column_names), nrow = nrow(test_features)))
+colnames(corrected_test_df) <- column_names
+
+for (i in column_names) {
+  if (i  %in% c("LB01SDV__LB03", "PT", "cummulative_diagnosis", "CA19_9", "Disease_status", "predCA19_9", "LewisAg", "MH07SDV__MH16")) {
+    corrected_test_df[[i]] <- test_features[[i]]
+  } else {
+    banner(i)
+    print("Concordance Correlation Coefficient ======>")
+    ccc <- epiR::epi.ccc(matched_train[[i]], matched_test[[i]], ci="z-transform", conf.level=0.95)
+    ccc.result <- ccc$rho.c
+    print(ccc.result)
+    
+    ## plot distribution
+    p <- ggplot(data = data.frame(x = matched_train[[i]], y = matched_test[[i]]),
+                aes(x=x,y=y)) +
+      geom_point(shape=21,
+                 color="black",
+                 fill = "dodgerblue",
+                 alpha= 0.5,
+                 size = 3) +
+      stat_smooth(method = lm) +
+      theme_bw() +
+      ggtitle(i) +
+      xlab("Imputed Transformed Scaled Data (Train)") +
+      ylab("Imputed Transformed Scaled Data (Test)")
+    
+    print(p)
+    
+    # Reshape data for scikit-learn
+    X <- matrix(matched_test[[i]], ncol = 1)
+    y <- matrix(matched_train[[i]], ncol = 1)
+
+    # Train a linear regression model
+    model <- lm(y ~ X)
+
+    correction_slope <- coef(model)[2]
+    correction_intercept <- coef(model)[1]
+    
+    # Correct the test features using the linear regression model
+    
+    corrected_test_df[[i]] <- test_features[[i]] * correction_slope + correction_intercept
+    
+    # Combine data for plotting
+  combined_data <- data.frame(
+    group = rep(c("Train", "Test (uncorrected)", "Test (corrected)"), 
+                c(length(train_features[[i]]), 
+                  length(test_features[[i]]), 
+                  length(corrected_test_df[[i]]))),
+    value = c(train_features[[i]], test_features[[i]], corrected_test_df[[i]]))
+  
+  combined_data$group <- factor(combined_data$group, levels = c(c("Train", "Test (uncorrected)", "Test (corrected)")))
+    
+        ## plot distribution
+    p <- ggplot(data = combined_data,
+                aes(x=group,
+                    y=value,
+                    fill=group)) +
+      geom_boxplot() +
+      ggbeeswarm::geom_quasirandom(shape=21,
+                 color="black", alpha = 0.5) +
+      theme_bw() +
+      ggtitle(i) +
+      xlab("Imputed Transformed Scaled Data (Train)") +
+      ylab("Imputed Transformed Scaled Data (Test)") +
+      scale_fill_brewer(palette = "Set1")
+    
+    print(p)
+  }
+}
+
+## add non transformed CA19.9
+corrected_test_df$CA19_9_nontransformed <- metabolon_dat$CA19_9
+
+saveRDS(corrected_test_df, "results/corrected_test_df.rds")
+```
+
+# Computing environment
+```{r}
+sessionInfo()
+```

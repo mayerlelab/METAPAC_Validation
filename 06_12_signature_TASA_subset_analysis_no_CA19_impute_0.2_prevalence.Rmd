@@ -1,0 +1,1044 @@
+---
+title: "MetaPac"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: '__12 signature TASA (CONSORT)__'
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse",
+                      "h2o",
+                      "caret",
+                      "glmnet",
+                      "Rmisc",
+                      "ROCR")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+## custom functions
+```{r}
+## predictions functions
+perf.glmnet <- function(truth, pred, predClass, boot.n = 1000, prevalence) {
+  reps <- boot.n
+  predClass <- as.factor(predClass)
+  boot.pred <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.predClass <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.truth <- matrix(0, nrow = length(truth), ncol = reps)
+  for (rep in 1:reps) {
+    bootstrap_indices <- sample(1:length(truth), length(truth), replace = TRUE)
+    boot.pred[, rep] <- pred[bootstrap_indices]
+    boot.predClass[, rep] <- predClass[bootstrap_indices]
+    boot.truth[, rep] <- truth[bootstrap_indices]
+  }
+  
+  pred.obj <- ROCR::prediction(boot.pred, boot.truth)
+  acc <- ROCR::performance(pred.obj, measure = "acc")
+  
+  cmResults <- data.frame()
+  
+  for (i in 1:ncol(boot.truth)) {
+    cm <- caret::confusionMatrix(as.factor(boot.truth[,i]), 
+                          as.factor(boot.predClass[,i]), 
+                          prevalence = prevalence)
+    
+    cmResults[i, "accuracy"] = cm$overall['Accuracy']
+    cmResults[i, "specificity"] = cm$byClass["Specificity"]
+    cmResults[i,"sensitivity"] = cm$byClass["Sensitivity"]
+    cmResults[i, "ppv"] = cm$byClass["Pos Pred Value"]
+    cmResults[i, "npv"] = cm$byClass["Neg Pred Value"]
+    
+  }
+  
+  perf <- list(pred = pred, 
+               truth = truth, 
+               roc = ROCR::performance(pred.obj, measure = "tpr",x.measure = "fpr"), 
+               auc = ROCR::performance(pred.obj, measure = "auc"), 
+               acc = ROCR::performance(pred.obj,
+                                 measure = "acc"),
+               cmResults = cmResults
+               )
+  invisible(perf)
+  
+}
+
+## roc curves
+plotROC <- function(model.list,model.names) {
+  df <- data.frame()
+  auc <- list()
+  for (l in 1:length(model.list)) {
+    perf.roc <- model.list[[l]]$roc
+    perf.avg <- perf.roc
+    alpha.values.list <- unlist(perf.avg@alpha.values)
+    alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+    
+    alpha.values <- rev(seq(min(alpha.values.list),
+                            max(alpha.values.list),
+                            length=max(sapply(perf.avg@alpha.values, length))))
+    for (i in 1:length(perf.avg@y.values)) {
+      perf.avg@x.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]],perf.avg@x.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+      perf.avg@y.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+    }
+    
+    x <- c(rowMeans(data.frame(perf.avg@x.values)),0)
+    y <- c(rowMeans(data.frame(perf.avg@y.values)),0)
+    
+    df_unique <- data.frame(fpr=x,
+                            tpr=y,
+                            model=model.names[l])
+    colnames(df_unique) <- c("fpr", "tpr", "model")
+    
+    df <- rbind(df, df_unique)
+    
+    ## auc
+    auc[[model.names[l]]] <- Rmisc::CI(as.numeric(model.list[[l]]$auc@y.values), ci=.95)
+  }
+  
+  col <- RColorBrewer::brewer.pal(length(unique(df$model)), "Set1")
+  plot <- ggplot(df,
+                 aes(x=fpr,
+                     y=tpr,
+                     color=model)) +
+    geom_line(size=2) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(size = 0.75),
+      axis.text = element_text(
+        size = 11,
+        face = "bold",
+        colour = "black"
+      ),
+      axis.title = element_text(size = 12, face = "bold")
+    ) +
+    scale_color_manual(values = col) +
+    theme(legend.position = c(0.8, 0.1),
+          legend.background = element_blank(),
+          legend.text = element_text(size= 12, face="bold"),
+          legend.title = element_blank()) +
+    labs(x="False Positive Rate",
+         y="True Positive Rate")
+}
+
+```
+
+## initiate h2o environment
+```{r}
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+#Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/zulu-11.jdk")
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+```
+# load TASA dataset
+```{r}
+merged_data <- readRDS("results/corrected_test_df.rds")
+```
+
+## set up X and Y variables
+```{r}
+mets <- c("578100101", "578100121","578100133", "578100402","578100404",
+          "578100603", "578100607", "578100608","578100624",
+          "578100716","578100812","578100822") 
+
+x_var <- c(paste0("X", mets),"CA19_9")
+y_var <- "Disease_status"
+
+prevalence <- 20/100
+```
+
+
+## Performance of CA19.9
+
+```{r}
+## CA19.9 Elastic Net model
+x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfitCa19.9.RData")
+model_Ca19.9 <- get(x)
+```
+
+### Lewis Ag Positive
+
+```{r}
+merged_data1 <- merged_data %>%
+  filter(LewisAg == "Positive")
+
+table(merged_data1$Disease_status)
+
+X_val_Ca19.9 <- as.matrix(cbind(0, CA19_9=merged_data1[,colnames(merged_data1) %in% "CA19_9_nontransformed"]))
+
+## predict performance
+predictionCa19.9 <- predict(model_Ca19.9,
+                            newx = X_val_Ca19.9,
+                            s = model_Ca19.9$lambda,
+                            type="response")
+
+## add predictions
+colnames(predictionCa19.9) <- "prediction"
+merged_data1$predictionCa19.9 <- as.vector(predictionCa19.9)
+
+## calculate performance
+perfCa19.9 <- perf.glmnet(pred = merged_data1$predictionCa19.9,
+                         truth =as.factor(merged_data1$Disease_status),
+                         predClass = as.factor(merged_data1$predCA19_9),
+                         prevalence = prevalence, boot.n = 100)
+
+### AUC and accuracy
+Rmisc::CI(as.numeric(perfCa19.9$auc@y.values), ci=.95)
+sapply(perfCa19.9$cmResults, Rmisc::CI)
+```
+
+### Stage I/II
+```{r}
+merged_data1 <- merged_data %>%
+  filter(MH07SDV__MH16 %in% c("1","2", "3") | Disease_status == "CP")
+
+table(merged_data1$Disease_status)
+
+X_val_Ca19.9 <- as.matrix(cbind(0, CA19_9=merged_data1[,colnames(merged_data1) %in% "CA19_9_nontransformed"]))
+
+## predict performance
+predictionCa19.9 <- predict(model_Ca19.9,
+                            newx = X_val_Ca19.9,
+                            s = model_Ca19.9$lambda,
+                            type="response")
+
+## add predictions
+colnames(predictionCa19.9) <- "prediction"
+merged_data1$predictionCa19.9 <- as.vector(predictionCa19.9)
+
+## calculate performance
+perfCa19.9 <- perf.glmnet(pred = merged_data1$predictionCa19.9,
+                         truth =as.factor(merged_data1$Disease_status),
+                         predClass = as.factor(merged_data1$predCA19_9),
+                         prevalence = prevalence, boot.n = 100)
+
+### AUC and accuracy
+Rmisc::CI(as.numeric(perfCa19.9$auc@y.values), ci=.95)
+sapply(perfCa19.9$cmResults, Rmisc::CI)
+```
+
+## 4 met signature
+```{r}
+## H2O machine learning model
+model_4mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140114.zip")
+cutoff_4mets <- 0.773555
+```
+
+### Lewis Ag positive
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(LewisAg == "Positive") %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  filter(LewisAg == "Positive") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_4mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_4mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_4mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_4mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+### Lewis Ag Negative
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(LewisAg == "Negative") %>%
+  select(all_of(x_var)) %>%
+  dplyr::select(CA19_9)
+
+Y_val <- merged_data %>%
+  filter(LewisAg == "Negative") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_4mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_4mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_4mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_4mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+### CA19.9 < 37
+
+```{r}
+merged_data1 <- merged_data %>%
+  filter(predCA19_9 == "CP")
+
+table(merged_data1$Disease_status)
+## split X and Y
+X_val <- merged_data %>%
+  filter(predCA19_9 == "CP") %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  filter(predCA19_9 == "CP") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_4mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_4mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_4mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_4mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+### Stage I/II
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(MH07SDV__MH16 %in% c("1","2", "3") | Disease_status == "CP") %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  filter(MH07SDV__MH16 %in% c("1","2", "3") | Disease_status == "CP") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_4mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_4mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_4mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_4mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+## 12 met signature
+```{r}
+## H2O machine learning model
+model_12mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140000.zip")
+cutoff_12mets <- 0.6761076
+```
+
+### Lewis Ag positive
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(LewisAg == "Positive") %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  filter(LewisAg == "Positive") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_12mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_12mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_12mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_12mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+### Lewis Ag negative
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(LewisAg == "Negative") %>%
+  select(all_of(x_var)) %>%
+  dplyr::select(CA19_9)
+
+Y_val <- merged_data %>%
+  filter(LewisAg == "Negative") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_12mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_12mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_12mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_12mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+### CA19.9 <37
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(predCA19_9 == "CP") %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  filter(predCA19_9 == "CP") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_12mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_12mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_12mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_12mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+### Stage I/II
+
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  filter(MH07SDV__MH16 %in% c("1","2", "3") | Disease_status == "CP") %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  filter(MH07SDV__MH16 %in% c("1","2", "3") | Disease_status == "CP") %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+perf <- h2o.performance(model_12mets, val_h2o)
+print(perf) 
+
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_12mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+                                                                               cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+print(cm)
+
+## 10 fold cross validation
+cv.results <- data.frame()
+# split data for 10 fold cross validation ------------ Create 10 equally size folds
+folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+# performance on 10 fold cross validation ----------------
+for (i in 1:10) {
+  # Segement your data by fold using the which() function
+  Indexes <- which(folds == i, arr.ind = TRUE)
+  test.cv <- val_h2o[-Indexes, ]
+  perf.cv <- h2o.performance(model_12mets, newdata = test.cv)
+  
+  cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_12mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC", prevalence = prevalence)
+  
+  cv.results[i, 1] <- i
+  cv.results[i, 2] <- perf.cv@metrics$MSE
+  cv.results[i, 3] <- perf.cv@metrics$RMSE
+  cv.results[i, 4] <- perf.cv@metrics$r2
+  cv.results[i, 5] <- perf.cv@metrics$logloss
+  cv.results[i, 6] <- perf.cv@metrics$AUC
+  cv.results[i, 7] <- perf.cv@metrics$pr_auc
+  cv.results[i, 8] <- perf.cv@metrics$Gini
+  cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+  cv.results[i, 10] = cm$overall["Accuracy"]
+  cv.results[i, 11] = cm$byClass["Specificity"]
+  cv.results[i, 12] = cm$byClass["Sensitivity"]
+  cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+  cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+}
+
+colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini", 
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+cv.results.summary <- 
+  cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>% 
+  group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value), 
+                                     min = min(value), 
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+
+knitr::kable(cv.results.summary)
+```
+
+## 12 met signature without CA19.9
+```{r}
+x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfit_lewis.RData")
+model_12mets <- get(x)
+cutoff_12mets <- 0.362
+```
+
+### Lewis Ag positive
+
+```{r}
+merged_data1 <- merged_data %>%
+  filter(LewisAg == "Negative")
+
+table(merged_data1$Disease_status)
+
+## split X and Y
+X_val <- merged_data %>%
+  filter(LewisAg == "Negative") %>%
+  select(all_of(x_var)) %>%
+  select(-CA19_9)
+
+Y_val <- merged_data %>%
+  filter(LewisAg == "Negative") %>%
+  select(all_of(y_var))
+
+prediction = as.data.frame(predict(model_12mets,
+                     newx = as.matrix(X_val),
+                     s = model_12mets$lambda,
+                     type="response"))
+
+## add predictions
+colnames(prediction) <- "prediction"
+merged_data1$prediction_mfit <- as.vector(prediction$prediction)
+
+merged_data1$predictionClass_mfit <- ifelse(merged_data1$prediction_mfit < cutoff_12mets, "CP", "PDAC")
+
+## calculate performance
+perf <- perf.glmnet(pred = merged_data1$prediction_mfit,
+                         truth =as.factor(merged_data1$Disease_status),
+                         predClass = as.factor(merged_data1$predictionClass_mfit),
+                         prevalence = prevalence, boot.n = 100)
+
+### AUC and accuracy
+Rmisc::CI(as.numeric(perf$auc@y.values), ci=.95)
+sapply(perf$cmResults, Rmisc::CI)
+
+## confusion matrix
+caret::confusionMatrix(as.factor(Y_val$Disease_status),
+                as.factor(merged_data1$predictionClass_mfit),
+                positive = "PDAC")
+```
+
+# Computing environment
+```{r}
+sessionInfo()
+```

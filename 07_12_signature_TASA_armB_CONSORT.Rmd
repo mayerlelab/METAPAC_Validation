@@ -1,0 +1,228 @@
+---
+title: "MetaPac"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: '__12 signature TASA (CONSORT)__'
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse",
+                      "raster",
+                      "officer",
+                      "gtsummary")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+# load TASA dataset
+```{r}
+tasa_dat <- readxl::read_excel("../../../../MetaPac_Phase_III_results/KLUM-0203-21TACP/KLUM-0203-21TACP CDT.XLSX")
+
+## subset data
+tasa_dat <- tasa_dat %>%
+  janitor::clean_names("none") %>%
+  mutate(Result=as.numeric(Results_mg_mL))
+```
+
+## replace names to ids
+```{r}
+n12_met_id <- readxl::read_excel("../../../../12_met_signatures_id/metabolites_to_ids.xlsx")
+
+tasa_dat <- tasa_dat %>%
+  mutate(Metabolite_Name = n12_met_id$Metabolite_ID[match(Analyte, n12_met_id$Metabolite_Name)])
+```
+
+## process dataset
+```{r}
+## convert Unique_Tube_Label_ID to chracters
+tasa_dat$Client_Sample_ID <- as.character(as.numeric(tasa_dat$Client_Sample_ID))
+
+## clear patient Names
+tasa_dat$LB01SDV__LB03 <- as.character(gsub("^.{3}|.{3}$", "", tasa_dat$Client_Sample_ID))
+
+tasa_dat <- tasa_dat %>%
+  dplyr::select(LB01SDV__LB03, Metabolite_Name, Result) %>%
+  group_by(LB01SDV__LB03, Metabolite_Name) %>%
+  summarise_if(is.numeric, mean) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "Metabolite_Name", values_from = "Result")
+```
+
+# process metadata
+```{r}
+metadata <- readRDS("../../MetaData/metadata_final/processed_metadata/metadata_flatten_df_armB.rds")
+
+SAMPLE_ANALYSIS_DATE <- as.Date("20240224", "%Y%m%d") ## date of final report
+
+banner("patients accessed for eligibilility")
+screening <- metadata %>%
+  filter(CPEVENT == "V0 SCREENING") %>%
+  distinct(PT) %>%
+  unlist()
+
+print(length(screening))
+
+banner("patients recruited")
+baseline <- metadata %>%
+  filter(CPEVENT == "V1 BASELINE") %>%
+  distinct(PT) %>%
+  unlist()
+
+print(length(baseline))
+
+banner("patient excluded")
+excluded <- setdiff(screening, baseline)
+print(length(excluded))
+
+banner("patient excluded -- reason")
+
+excluded_reason <- metadata %>%
+  filter(CPEVENT == "V0 SCREENING") %>%
+  filter(PT %in% excluded) %>%
+  dplyr::select_if(~sum(!is.na(.)) > 0)
+
+print(excluded)
+
+## process metadata
+metadata_screening <- metadata %>%
+  filter(CPEVENT %in% "V0 SCREENING") %>%
+  select_if(~sum(!is.na(.)) > 0) %>%
+  mutate(DM__DMDAT=as.Date(DM__DMDAT, "%Y%m%d")) %>%
+  mutate(SAMPLE_STORAGE=as.numeric(difftime(SAMPLE_ANALYSIS_DATE, DM__DMDAT, units="days"))) %>%
+  dplyr::select(PT, 
+         DM__LBORRESN, 
+         DM__AGEDIAG,
+         DM__SEX,
+         SAMPLE_STORAGE) %>%
+  mutate(DM__LBORRESN=as.numeric(DM__LBORRESN)) %>%
+  dplyr::rename(Hb1ac = DM__LBORRESN) 
+
+
+metadata_baseline <- metadata %>%
+  filter(CPEVENT %in% "V1 BASELINE") %>%
+  select_if(~sum(!is.na(.)) > 0) %>%
+  dplyr::select(PT, 
+         LB01SDV__LB03, 
+         `LB03__CA19-9_U/ml`, 
+         DM__BMI) %>%
+  mutate(`LB03__CA19-9_U/ml`=as.numeric(`LB03__CA19-9_U/ml`),
+         DM__BMI=as.numeric(DM__BMI)) %>%
+  dplyr::rename(CA19_9 = `LB03__CA19-9_U/ml`) 
+
+metadata_screening_baseline <- metadata_screening %>%
+  full_join(metadata_baseline, by = "PT") 
+
+## patients per visit
+table(metadata$CPEVENT)
+
+## metabolites analysed per visit
+
+metadata_sub <- metadata %>%
+  dplyr::select(PT, LB01SDV__LB03, CPEVENT, `LB03__CA19-9_U/ml`) %>%
+  inner_join(tasa_dat, by = "LB01SDV__LB03") %>%
+  mutate(`LB03__CA19-9_U/ml`=as.numeric(`LB03__CA19-9_U/ml`)) %>%
+  dplyr::rename(CA19_9 = `LB03__CA19-9_U/ml`)  
+
+table(metadata_sub$CPEVENT)
+
+## process data for analysis
+merged_data <- metadata_sub %>%
+  drop_na(CA19_9) %>%
+  mutate(predCA19_9= ifelse(CA19_9 < 37, "CP", "PDAC"),
+         LewisAg = ifelse(CA19_9 < 10, "Negative", "Positive"),
+         Disease_status = "CP")
+
+metadata_safety <- metadata %>%
+  filter(CPEVENT %in% "V7 SAFETY CALL") %>%
+  select_if(~sum(!is.na(.)) > 0)
+
+
+## save merged data
+saveRDS(merged_data, "results/merged_TASA_data_armB.rds")
+```
+
+# demographics
+```{r}
+drop_cols <- c("PT", "LB01SDV__LB03")
+
+dat <- metadata_screening_baseline %>%
+    dplyr::select(-any_of(drop_cols)) %>%
+    mutate(cummulative_diagnosis = "DM")
+
+# set documents properties
+sect_properties <- prop_section(
+  page_size(width = 21, height = 29.7, orient = "portrait"),
+  type = "continuous",
+  page_margins = page_mar()
+)
+
+## create summary table 
+summaryStat <- dat %>% 
+  tbl_summary(by = cummulative_diagnosis,
+              type = all_continuous() ~ "continuous2",
+              statistic = list(all_categorical() ~ "{n}/{N} ({p}%)",
+                               all_continuous() ~ "{median} ({p25}-{p75})"),
+              digits = all_continuous() ~ 1,
+              missing = "no") %>% 
+  add_n() %>%
+  bold_labels() %>% 
+  as_flex_table() 
+
+summaryStat
+
+#YesSiR::exportxlsx(summaryStat, path="./results/descriptives_gtsummary.xlsx")
+
+# Adjust table width to fit the page
+summaryStat <- flextable::set_table_properties(
+  summaryStat,
+  width = .9, # Adjust the width as needed (e.g., 0.9 for 90% of the page width)
+  layout = "autofit"
+)
+
+# Save as Word document
+flextable::save_as_docx(
+  x = summaryStat,
+  path = "./results/descriptives_gtsummary_armB.docx",
+  pr_section = sect_properties
+)
+```
+
+
+# Computing environment
+```{r}
+sessionInfo()
+```

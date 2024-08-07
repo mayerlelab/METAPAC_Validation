@@ -1,0 +1,124 @@
+---
+title: "MetaPac"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+    toc_float: true
+subtitle: '__12 signature TASA (save Mojo)__'
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("~/r_functions/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+## upload correct version of h2o
+```{r}
+h2o_version <- "3.32.1.3"
+
+if (packageVersion("h2o") != h2o_version) {
+  # The following two commands remove any previously installed H2O packages for R.
+  if ("package:h2o" %in% search()) { 
+    detach("package:h2o", unload=TRUE) 
+    }
+  if ("h2o" %in% rownames(installed.packages())) { 
+    remove.packages("h2o") 
+    }
+  # Next, we download packages that H2O depends on.
+  pkgs <- c("RCurl","jsonlite")
+  for (pkg in pkgs) {
+    if (! (pkg %in% rownames(installed.packages()))) { 
+      install.packages(pkg) 
+    }
+}
+  # Now we download, install and initialize the H2O package for R.
+    install.packages("h2o", type="source", repos="https://h2o-release.s3.amazonaws.com/h2o/rel-zipf/3/R")
+    
+    library(h2o)
+}
+
+library(h2o)
+
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+# Sys.setenv(JAVA_HOME = "/dss/dsshome1/lxc00/ru64waf2/bin/jdk-13.0.2")
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+```
+
+## create 4-met signature model  MOJO
+```{r}
+## H2O machine learning model
+model_4mets <- h2o.loadModel("../../../ID_VD1_VD2_models/h2o_results/feature_reduction/GLM_1_AutoML_20211203_140114")
+
+path <- "../production_models"
+h2o.download_mojo(model_4mets, path = path)
+```
+
+
+## create 12-met signature model  MOJO
+```{r}
+## H2O machine learning model
+model_12mets <- h2o.loadModel("../../../ID_VD1_VD2_models/h2o_results/base/GLM_1_AutoML_20211203_140000")
+h2o.download_mojo(model_12mets, path = path)
+```
+## create 12-met low CA19.9 signature model  MOJO
+```{r}
+## H2O machine learning model
+model_12mets_lowCA <- h2o.loadModel("../../../ID_VD1_VD2_models/h2o_results/base_lowCA/GLM_1_AutoML_20220622_173752")
+h2o.download_mojo(model_12mets_lowCA, path = path)
+```
+
+# Computing environment
+```{r}
+h2o.shutdown(prompt = FALSE)
+sessionInfo()
+```
