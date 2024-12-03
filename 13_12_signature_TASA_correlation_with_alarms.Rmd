@@ -1,0 +1,341 @@
+---
+title: "MetaPac"
+subtitle: "12 signature TASA (early alarms)"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
+)
+options(width = 60,
+        digits = 3,
+        scipen = 999)
+```
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse",
+                      "h2o",
+                      "caret",
+                      "glmnet",
+                      "Rmisc",
+                      "ROCR")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+## initiate h2o environment
+```{r}
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+#Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/zulu-11.jdk")
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+```
+
+# load TASA dataset
+```{r}
+merged_data <- readRDS("results/corrected_test_df.rds")
+```
+
+## set up X and Y variables
+```{r}
+mets <- c("578100101", "578100121","578100133", "578100402","578100404",
+          "578100603", "578100607", "578100608","578100624",
+          "578100716","578100812","578100822") 
+
+x_var <- c(paste0("X", mets),"CA19_9")
+y_var <- "Disease_status"
+
+## split X and Y
+X_val <- merged_data %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  select(all_of(y_var))
+
+# prevalence <- 489/1129
+```
+
+## metadata
+```{r}
+metadata <- readRDS("../../MetaData/metadata_final/processed_metadata/metadata_flatten_df_cumm_diagnosis.rds")
+
+metadata <- metadata %>%
+  filter(CPEVENT == "V1 BASELINE") %>%
+  dplyr::select(PT, `LB02__Bilirubin_µmol/l`,`LB02__HbA1c_%`) %>%
+  mutate(`LB02__Bilirubin_µmol/l` = as.numeric(`LB02__Bilirubin_µmol/l`),
+        `LB02__HbA1c_%` = as.numeric(`LB02__HbA1c_%`))
+
+colnames(metadata) <- c("PT", "Bilirubin", "HbA1c")
+
+## add bilirubin
+merged_data <- merged_data %>%
+  inner_join(metadata, by ="PT")
+
+```
+
+## Performance of CA19.9
+
+```{r}
+## CA19.9 Elastic Net model
+x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfitCa19.9.RData")
+model_Ca19.9 <- get(x)
+
+X_val_Ca19.9 <- as.matrix(cbind(0, CA19_9=merged_data[,colnames(merged_data) %in% "CA19_9_nontransformed"]))
+
+## predict performance
+predictionCa19.9 <- predict(model_Ca19.9,
+                            newx = X_val_Ca19.9,
+                            s = model_Ca19.9$lambda,
+                            type="response")
+
+## add predictions
+colnames(predictionCa19.9) <- "prediction"
+merged_data$predictionCa19.9 <- as.vector(predictionCa19.9)
+```
+
+## 12 metabolite CLIA signature
+```{r}
+## 12 metabolite CLIA signature
+x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfit.RData")
+model_12mets <- get(x)
+
+cutoff <- 0.5718562
+
+prediction = as.data.frame(predict(model_12mets,
+                     newx = as.matrix(X_val),
+                     s = model_12mets$lambda,
+                     type="response"))
+
+## add predictions
+colnames(prediction) <- "prediction"
+merged_data$prediction_mfit <- as.vector(prediction$prediction)
+
+merged_data$predictionClass_mfit <- ifelse(merged_data$prediction_mfit < cutoff, "CP", "PDAC")
+```
+
+## 4 met signature
+```{r}
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+## H2O machine learning model
+model_4mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140114.zip")
+
+perf <- h2o.performance(model_4mets, val_h2o)
+perf
+```
+
+### confusion matrix
+```{r}
+cutoff_4mets <- 0.773555
+# cutoff.selected.model <- 0.773555
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_4mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+    cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+
+## add predictions to merged_data
+prediction <- as.data.frame(h2o.predict(model_4mets, val_h2o))
+merged_data$prediction_4mets <- prediction$PDAC
+```
+
+## 12 met signature
+```{r}
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+## H2O machine learning model
+model_12mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140000.zip")
+
+perf <- h2o.performance(model_12mets, val_h2o)
+perf
+```
+### confusion matrix
+```{r}
+cutoff_12mets <- 0.6761076
+## confusion matrix
+cm <- as.data.frame(h2o.confusionMatrix(perf, cutoff_12mets))
+## enlist categories
+lvs <- c("CP", "PDAC")
+## truth
+truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+## pred
+pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2], 
+    cm$PDAC[2]))), levels = rev(lvs))
+## xtab
+xtab <- table(pred, truth)
+## confusion matrix
+cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+## add predictions to merged_data
+prediction <- as.data.frame(h2o.predict(model_12mets, val_h2o))
+merged_data$prediction_12mets <- prediction$PDAC
+```
+
+## early alarm correlation
+```{r}
+df <- merged_data %>%
+  dplyr::select(QL, PANPA, Bilirubin, HbA1c, Disease_status, CA19_9_nontransformed, prediction_mfit, prediction_4mets,prediction_12mets) %>%
+  pivot_longer(-c("Disease_status", "CA19_9_nontransformed", "prediction_mfit", "prediction_4mets","prediction_12mets"),
+              names_to = "alarms",
+              values_to = "values")
+
+p1 <- ggplot(df,
+            aes(x=CA19_9_nontransformed, 
+                y=values)) + 
+  geom_point(aes(color=Disease_status), 
+             alpha=0.2) + 
+  geom_smooth(aes(color=Disease_status,
+                  fill=Disease_status),
+              method=lm, 
+              se=TRUE, 
+              show.legend =FALSE) +
+  theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  ) + 
+  ggpubr::stat_cor(aes(color=Disease_status), label.x = 0.1, 
+              show.legend =FALSE) +
+  geom_vline(xintercept = 37) +
+  facet_wrap(~alarms, scales = "free", nrow=4) +
+  scale_fill_manual(values=c("#79AF97FF","#B24745FF")) +
+  scale_color_manual(values=c("#79AF97FF","#B24745FF"))
+
+p2 <- ggplot(df,
+            aes(x=prediction_12mets, 
+                y=values)) + 
+  geom_point(aes(color=Disease_status), 
+             alpha=0.2) + 
+  geom_smooth(aes(color=Disease_status,
+                  fill=Disease_status),
+              method=lm, 
+              se=TRUE, 
+              show.legend =FALSE) + 
+  theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  ) + 
+  ggpubr::stat_cor(aes(color=Disease_status), label.x = 0.1, 
+              show.legend =FALSE) +
+  geom_vline(xintercept = cutoff_12mets) +
+  facet_wrap(~alarms, scales = "free", nrow=4) +
+  scale_fill_manual(values=c("#79AF97FF","#B24745FF")) +
+  scale_color_manual(values=c("#79AF97FF","#B24745FF"))
+
+p3 <- ggplot(df,
+            aes(x=prediction_4mets, 
+                y=values)) + 
+  geom_point(aes(color=Disease_status), 
+             alpha=0.2) + 
+  geom_smooth(aes(color=Disease_status,
+                  fill=Disease_status),
+              method=lm, 
+              se=TRUE, 
+              show.legend =FALSE) +
+  theme_bw() +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  ) + 
+  ggpubr::stat_cor(aes(color=Disease_status), label.x = 0.1, 
+              show.legend =FALSE) +
+  geom_vline(xintercept = cutoff_4mets) +
+  facet_wrap(~alarms, scales = "free", nrow=4) +
+  scale_fill_manual(values=c("#79AF97FF","#B24745FF")) +
+  scale_color_manual(values=c("#79AF97FF","#B24745FF"))
+
+p <- ggpubr::ggarrange(p1,p2,p3, ncol=3, nrow =1, common.legend = TRUE, legend="bottom")
+
+print(p)
+
+ggsave(filename = "results/early_alarms_correlation.pdf",
+       plot=p,
+       width = 7, height =10,
+       dpi= 300)
+
+```
+
+# Computing environment
+```{r}
+sessionInfo()
+```

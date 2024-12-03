@@ -1,0 +1,325 @@
+---
+title: "MetaPac"
+subtitle: "12 signature TASA (inverse probability weighting (IPW))"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
+)
+options(width = 60,
+        digits = 3,
+        scipen = 999)
+```
+
+sample weights ->
+To address this concern, we have implemented inverse probability weighting (IPW) to adjust for the enrichment design without requiring model retraining. The weights were calculated as the ratio of original population prevalence (1%) to enriched sample prevalence (20%) for PDAC cases, and correspondingly for controls. This post-hoc adjustment allows us to estimate model performance metrics that would be expected in the target population while maintaining the statistical efficiency gained from the enriched design.
+
+The weighted analysis yielded results, which are consistent with our original findings, supporting the robustness of our conclusions. This approach is well-established in the literature for handling enriched designs (Breslow et al 2009).
+
+The implemented weighting scheme effectively accounts for the sampling strategy while preserving the model's discriminative ability. This adjustment provides estimates that are generalizable to the target population while taking advantage of the statistical efficiency gained through the enrichment design."
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse",
+                      "h2o",
+                      "caret",
+                      "glmnet",
+                      "Rmisc",
+                      "ROCR")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+## custom functions
+```{r}
+# Original population PDAC prevalence (assumed to be ~1% in general population)
+original_prev <- 0.01
+# Enriched sample prevalence (20% as stated)
+enriched_prev <- 0.20
+
+# Calculate sampling weights
+# Weight = original probability / enriched probability
+weight_pdac <- original_prev / enriched_prev  # for PDAC cases
+weight_control <- (1-original_prev) / (1-enriched_prev)  # for controls
+
+adjust_predictions_with_ci <- function(pred_probs, actual_labels, cutoff, n_bootstrap = 1000, seed = 123) {
+  # Set seed for reproducibility
+  set.seed(seed)
+  
+  # Base function to calculate metrics with error handling
+  calculate_metrics <- function(pred_probs, actual_labels, cutoff, weights) {
+    tryCatch({
+      # Calculate weighted AUC using pROC
+      weighted_roc <- pROC::roc(actual_labels, 
+                               pred_probs, 
+                               weights = weights,
+                               quiet = TRUE,
+                               auc = TRUE)
+      
+      # Make predictions based on cutoff
+      pred_class <- pred_probs >= cutoff
+      
+      # Calculate weighted confusion matrix elements
+      true_pos <- sum(weights[pred_class & actual_labels == "PDAC"])
+      false_pos <- sum(weights[pred_class & actual_labels != "PDAC"])
+      true_neg <- sum(weights[!pred_class & actual_labels != "PDAC"])
+      false_neg <- sum(weights[!pred_class & actual_labels == "PDAC"])
+      
+      # Add small epsilon to prevent division by zero
+      epsilon <- 1e-10
+      
+      # Calculate weighted metrics with safety checks
+      weighted_sensitivity <- true_pos / (true_pos + false_neg + epsilon)
+      weighted_specificity <- true_neg / (true_neg + false_pos + epsilon)
+      weighted_ppv <- true_pos / (true_pos + false_pos + epsilon)
+      weighted_npv <- true_neg / (true_neg + false_neg + epsilon)
+      weighted_accuracy <- (true_pos + true_neg) / (true_pos + true_neg + false_pos + false_neg + epsilon)
+      
+      return(c(
+        auc = as.numeric(weighted_roc$auc),
+        accuracy = weighted_accuracy,
+        sensitivity = weighted_sensitivity,
+        specificity = weighted_specificity,
+        ppv = weighted_ppv,
+        npv = weighted_npv
+      ))
+    }, error = function(e) {
+      # Return NA vector if calculation fails
+      return(rep(NA, 6))
+    })
+  }
+  
+  # Create weights vector for original data
+  weights <- ifelse(actual_labels == "PDAC", weight_pdac, weight_control)
+  
+  # Calculate metrics on full dataset
+  original_metrics <- calculate_metrics(pred_probs, actual_labels, cutoff, weights)
+  
+  # Bootstrap
+  n <- length(pred_probs)
+  bootstrap_metrics <- matrix(NA, nrow = n_bootstrap, ncol = length(original_metrics))
+  colnames(bootstrap_metrics) <- names(original_metrics)
+  
+  # Progress counter
+  cat("Starting bootstrap iterations...\n")
+  
+  for(i in 1:n_bootstrap) {
+    if(i %% 100 == 0) cat(sprintf("Completed %d of %d iterations\n", i, n_bootstrap))
+    
+    # Sample with replacement
+    boot_indices <- sample(1:n, n, replace = TRUE)
+    boot_pred_probs <- pred_probs[boot_indices]
+    boot_actual_labels <- actual_labels[boot_indices]
+    boot_weights <- weights[boot_indices]
+    
+    # Calculate metrics for this bootstrap sample
+    bootstrap_metrics[i,] <- calculate_metrics(boot_pred_probs, boot_actual_labels, cutoff, boot_weights)
+  }
+  
+  # Remove any bootstrap iterations that produced NA values
+  bootstrap_metrics <- na.omit(bootstrap_metrics)
+  
+  if(nrow(bootstrap_metrics) < n_bootstrap * 0.9) {
+    warning(sprintf("Only %d of %d bootstrap iterations were successful", 
+                   nrow(bootstrap_metrics), n_bootstrap))
+  }
+  
+  # Calculate confidence intervals
+  ci_lower <- apply(bootstrap_metrics, 2, quantile, probs = 0.025, na.rm = TRUE)
+  ci_upper <- apply(bootstrap_metrics, 2, quantile, probs = 0.975, na.rm = TRUE)
+  
+  # Create final results dataframe
+  results_df <- data.frame(
+    metric = names(original_metrics),
+    estimate = original_metrics,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper
+  )
+  
+  # Add formatted string with estimate and CI
+  results_df$formatted <- sprintf("%.3f (%.3f-%.3f)", 
+                                results_df$estimate, 
+                                results_df$ci_lower, 
+                                results_df$ci_upper)
+  
+  return(results_df)
+}
+
+# Example usage:
+# results <- adjust_predictions_with_ci(pred_probs, actual_labels, cutoff = 0.5)
+# print(results)
+
+
+```
+
+## initiate h2o environment
+```{r}
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+#Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/zulu-11.jdk")
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+```
+# load TASA dataset
+```{r}
+merged_data <- readRDS("results/corrected_test_df.rds")
+```
+
+## set up X and Y variables
+```{r}
+mets <- c("578100101", "578100121","578100133", "578100402","578100404",
+          "578100603", "578100607", "578100608","578100624",
+          "578100716","578100812","578100822") 
+
+x_var <- c(paste0("X", mets),"CA19_9")
+y_var <- "Disease_status"
+```
+
+
+## Performance of CA19.9
+
+```{r}
+## CA19.9 Elastic Net model
+x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfitCa19.9.RData")
+model_Ca19.9 <- get(x)
+```
+
+### IPW
+
+```{r}
+X_val_Ca19.9 <- as.matrix(cbind(0, CA19_9=merged_data[,colnames(merged_data) %in% "CA19_9_nontransformed"]))
+
+## predict performance
+predictionCa19.9 <- predict(model_Ca19.9,
+                            newx = X_val_Ca19.9,
+                            s = model_Ca19.9$lambda,
+                            type="response")
+
+## add predictions
+colnames(predictionCa19.9) <- "prediction"
+merged_data$predictionCa19.9 <- as.vector(predictionCa19.9)
+
+## IPW
+adjust_predictions_with_ci(pred_probs = merged_data$predictionCa19.9,
+                   actual_labels = merged_data$Disease_status,
+                   cutoff = 37,
+                   n_bootstrap = 100)
+
+```
+## 4 met signature
+```{r}
+## H2O machine learning model
+model_4mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140114.zip")
+cutoff_4mets <- 0.773555
+```
+
+### IPW
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+prediction <- as.data.frame(h2o.predict(model_4mets, val_h2o))
+
+merged_data$prediction_4mets <- prediction$PDAC
+
+## IPW
+adjust_predictions_with_ci(pred_probs = merged_data$prediction_4mets,
+                   actual_labels = merged_data$Disease_status,
+                   cutoff = cutoff_4mets,
+                   n_bootstrap = 100)
+```
+## 12 met signature
+```{r}
+## H2O machine learning model
+model_12mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140000.zip")
+cutoff_12mets <- 0.6761076
+```
+
+### IPW
+```{r}
+## split X and Y
+X_val <- merged_data %>%
+  select(all_of(x_var))
+
+Y_val <- merged_data %>%
+  select(all_of(y_var))
+
+val_h2o <- as.h2o(cbind(X_val, Y_val))
+
+prediction <- as.data.frame(h2o.predict(model_12mets, val_h2o))
+
+merged_data$prediction_12mets <- prediction$PDAC
+
+## IPW
+adjust_predictions_with_ci(pred_probs = merged_data$prediction_12mets,
+                   actual_labels = merged_data$Disease_status,
+                   cutoff = cutoff_12mets,
+                   n_bootstrap = 100)
+```
+# Computing environment
+```{r}
+sessionInfo()
+```

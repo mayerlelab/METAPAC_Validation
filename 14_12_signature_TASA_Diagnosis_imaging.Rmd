@@ -1,0 +1,211 @@
+---
+title: "MetaPac"
+subtitle: "12 signature TASA (Diagnostic imaging)"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
+)
+options(width = 60,
+        digits = 3,
+        scipen = 999)
+```
+
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+# load TASA dataset
+```{r}
+merged_data <- readRDS("results/corrected_test_df.rds")
+```
+
+# load metadata
+```{r}
+# Load the metadata
+metadata <- readRDS(
+  "../../MetaData/metadata_final/processed_metadata/metadata_flatten_df_cumm_diagnosis.rds"
+)
+
+metadata <- metadata[metadata$PT %in% merged_data$PT,]
+
+
+df <- metadata %>%
+  dplyr::filter(CPEVENT %in% "V1 BASELINE") %>%
+  dplyr::select(PT,
+         CPEVENT,
+         MH08__MH205TCK,
+         MH08__MH206TCK,
+         MH08__MH207TCK,
+         MH08__MH208TCK,
+         MH08__MH209TCK,
+         cummulative_diagnosis) %>%
+  mutate(CENTER = gsub('.{3}$', '', PT)) %>%
+  rename(
+    abdominal_sonography = MH08__MH205TCK,
+    CT = MH08__MH206TCK,
+    MRCP_ERCP = MH08__MH208TCK,
+    Endosonography = MH08__MH207TCK,
+    other = MH08__MH209TCK
+  ) 
+
+# Create the summary table
+tbl <- df %>%
+  tbl_summary(
+    by = cummulative_diagnosis,
+    include = c(
+      abdominal_sonography,
+      CT,
+      MRCP_ERCP,
+      Endosonography,
+      other
+    ),
+    type = list(
+      everything() ~ "categorical"
+    ),
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no"
+  ) %>%
+  add_overall(last = TRUE) %>%
+  modify_header(label = "**Diagnosis Type**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Cumulative Diagnosis**") %>%
+  add_n() %>%
+  bold_labels() %>%
+  as_flex_table()
+
+print(tbl)
+
+## lesions
+
+df <- metadata %>%
+  dplyr::select(PT,
+         CPEVENT,
+         MH08__MH215TCK,
+         MH08__MH216TCK,
+         MH08__MH217TCK,
+         MH08__MH218TCK,
+         MH08__MH219TCK,
+         MH08__MH220TCK,
+         MH08__MH221TCK,
+         MH08__MH222TCK,
+         MH08__MH223TCK,
+         cummulative_diagnosis) %>%
+  group_by(PT) %>%
+  arrange(factor(CPEVENT, levels = rev(
+    c(
+      "V1 BASELINE",
+      "V2 MONAT 03",
+      "V3 MONAT 06",
+      "V4 MONAT 12",
+      "V5 MONAT 18",
+      "V6 MONAT 24"
+    )
+  ))) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-CPEVENT) %>%
+  rename(
+    Peudocysts = MH08__MH215TCK,
+    MCN = MH08__MH216TCK,
+    IPMN_side = MH08__MH217TCK,
+    IPMN_main = MH08__MH218TCK,
+    Serous_Cystadenoma = MH08__MH219TCK,
+    Cystic_Carcinoma = MH08__MH220TCK,
+    Dysontogenetic_Cyst = MH08__MH221TCK,
+    Cystic_Neuroendocrine_Tumor = MH08__MH222TCK,
+    other = MH08__MH223TCK
+  ) 
+
+# %>%
+#   filter(!cummulative_diagnosis %in% c("Akute Pankreatitis",
+#                                        "Pankreaskarzinom",
+#                                        "Chronische Pankreatitis"
+#                                        ))
+
+
+# Create the summary table
+tbl <- df %>%
+  tbl_summary(
+    by = cummulative_diagnosis,
+    include = c(
+      Peudocysts,
+      MCN,
+      IPMN_side,
+      IPMN_main,
+      Serous_Cystadenoma,
+      Cystic_Carcinoma,
+      Dysontogenetic_Cyst,
+      Cystic_Neuroendocrine_Tumor,
+      other
+    ),
+    type = list(
+      everything() ~ "categorical"
+    ),
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no"
+  ) %>%
+  add_overall(last = TRUE) %>%
+  modify_header(label = "**Diagnosis Type**") %>%
+  modify_spanning_header(all_stat_cols() ~ "**Cumulative Diagnosis**") %>%
+  add_n() %>%
+  bold_labels() %>%
+  as_flex_table()
+
+print(tbl)
+
+
+```
+
+# Computing environment
+```{r}
+sessionInfo()
+```

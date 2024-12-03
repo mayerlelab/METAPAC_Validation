@@ -1,0 +1,524 @@
+---
+title: "MetaPac"
+subtitle: "12 signature TASA (bootstrapping)"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
+)
+options(width = 60,
+        digits = 3,
+        scipen = 999)
+```
+
+# Load packages and datasets
+
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse",
+                      "h2o",
+                      "caret",
+                      "glmnet",
+                      "Rmisc",
+                      "ROCR")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+## custom functions
+```{r}
+## predictions functions
+perf.glmnet <- function(truth, pred, predClass, boot.n = 100) {
+  reps <- boot.n
+  predClass <- as.factor(predClass)
+  boot.pred <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.predClass <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.truth <- matrix(0, nrow = length(truth), ncol = reps)
+  for (rep in 1:reps) {
+    bootstrap_indices <- sample(1:length(truth), length(truth), replace = TRUE)
+    boot.pred[, rep] <- pred[bootstrap_indices]
+    boot.predClass[, rep] <- predClass[bootstrap_indices]
+    boot.truth[, rep] <- truth[bootstrap_indices]
+  }
+  
+  pred.obj <- ROCR::prediction(boot.pred, boot.truth)
+  acc <- ROCR::performance(pred.obj, measure = "acc")
+  
+  cmResults <- data.frame()
+  
+  for (i in 1:ncol(boot.truth)) {
+    cm <- caret::confusionMatrix(as.factor(boot.truth[,i]), 
+                          as.factor(boot.predClass[,i]))
+    
+    cmResults[i, "accuracy"] = cm$overall['Accuracy']
+    cmResults[i, "specificity"] = cm$byClass["Specificity"]
+    cmResults[i,"sensitivity"] = cm$byClass["Sensitivity"]
+    cmResults[i, "ppv"] = cm$byClass["Pos Pred Value"]
+    cmResults[i, "npv"] = cm$byClass["Neg Pred Value"]
+    
+  }
+  
+  perf <- list(pred = pred, 
+               truth = truth, 
+               roc = ROCR::performance(pred.obj, measure = "tpr",x.measure = "fpr"), 
+               auc = ROCR::performance(pred.obj, measure = "auc"), 
+               acc = ROCR::performance(pred.obj,
+                                 measure = "acc"),
+               cmResults = cmResults
+               )
+  invisible(perf)
+}
+
+# Define a function to calculate and store performance metrics
+calculate_performance_metrics <- function(model, val_data, cutoff) {
+  perf <- h2o::h2o.performance(model, newdata = val_data)
+  
+  # Get confusion matrix
+  cm <- as.data.frame(h2o::h2o.confusionMatrix(perf, cutoff))
+  lvs <- c("CP", "PDAC")
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],cm$PDAC[2]))), levels = rev(lvs))
+  xtab <- table(pred, truth)
+  
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+  
+  # Compile results
+  results <- data.frame(
+    mse = perf@metrics$MSE,
+    rmse = perf@metrics$RMSE,
+    r2 = perf@metrics$r2,
+    logloss = perf@metrics$logloss,
+    auc = perf@metrics$AUC,
+    prauc = perf@metrics$pr_auc,
+    gini = perf@metrics$Gini,
+    mean_per_class_error = perf@metrics$mean_per_class_error,
+    accuracy = cm$overall["Accuracy"],
+    specificity = cm$byClass["Specificity"],
+    sensitivity = cm$byClass["Sensitivity"],
+    ppv = cm$byClass["Pos Pred Value"],
+    npv = cm$byClass["Neg Pred Value"]
+  )
+  
+  return(results)
+}
+```
+
+## bootstrapping by prevalence
+```{r}
+if (!file.exists("results/bootstrapped_list.rds")) {
+# load TASA dataset
+merged_data <- readRDS("results/corrected_test_df.rds")
+
+table(merged_data$Disease_status)
+# Current proportions
+prop.table(table(merged_data$Disease_status))*100
+
+prevalence_buckets <- seq(1,20, 1)
+boot_n <- 1000
+
+merged_data_CP <- merged_data[merged_data$Disease_status %in% "CP",]
+merged_data_PDAC <- merged_data[merged_data$Disease_status %in% "PDAC", ]
+
+# Create quartiles for CA19_9 values in PDAC group
+merged_data_PDAC$CA19_9_quartile <- cut(merged_data_PDAC$CA19_9_nontransformed,
+                                       breaks = quantile(merged_data_PDAC$CA19_9_nontransformed,
+                                                       probs = seq(0, 1, 0.25),
+                                                       na.rm = TRUE),
+                                       labels = 1:4,
+                                       include.lowest = TRUE)
+
+total_rows <- nrow(merged_data)
+current_cp_count <- nrow(merged_data_CP)
+
+boot_list <- list()
+
+for (i in prevalence_buckets) {
+  banner(i)
+
+  
+  # Calculate the number of rows needed to make PDAC i% of the total dataset
+  desired_pdac_percent <- i / 100
+
+  # Calculate the new number of PDAC rows to achieve the desired percentage
+  required_pdac_count <- ceiling(desired_pdac_percent * current_cp_count / 
+                                 (1 - desired_pdac_percent))
+
+  # Calculate required samples per quartile
+  samples_per_quartile <- ceiling(required_pdac_count/4)
+
+  samples_list <- list()
+  # Perform sampling 1000 times
+  for (b in 1:boot_n) {
+    # Initialize empty dataframe for PDAC samples
+    merged_data_PDAC_subset <- data.frame()
+
+    # Sample from each quartile
+    for (q in 1:4) {
+      quartile_data <- merged_data_PDAC[merged_data_PDAC$CA19_9_quartile == q,]
+
+      # If there aren't enough samples in a quartile, sample with replacement
+      if (nrow(quartile_data) < samples_per_quartile) {
+        quartile_sample <- quartile_data[sample(nrow(quartile_data), 
+                                              samples_per_quartile, 
+                                              replace = TRUE),]
+      } else {
+        quartile_sample <- quartile_data[sample(nrow(quartile_data), 
+                                              samples_per_quartile, 
+                                              replace = FALSE),]
+      }
+
+      merged_data_PDAC_subset <- rbind(merged_data_PDAC_subset, quartile_sample)
+    }
+
+    # Trim excess rows if any (due to rounding up in samples_per_quartile)
+    if (nrow(merged_data_PDAC_subset) > required_pdac_count) {
+      merged_data_PDAC_subset <- merged_data_PDAC_subset[1:required_pdac_count,]
+    }
+
+    # Combine CP rows with the sampled PDAC rows
+    samples_list[[b]] <- bind_rows(merged_data_CP, merged_data_PDAC_subset)
+  }
+
+  boot_list[[paste0("prev_",i)]] <- samples_list
+}
+
+saveRDS(boot_list, "results/bootstrapped_list.rds")
+} else {
+    boot_list <- readRDS("results/bootstrapped_list.rds")
+    merged_data <- readRDS("results/corrected_test_df.rds")}
+```
+
+### QQ plot
+```{r}
+# Function to create QQ plot data with disease status
+create_qq_data <- function(original, bootstrapped, disease_status) {
+orig_values <- original$CA19_9_nontransformed[original$Disease_status == disease_status]
+boot_values <- bootstrapped$CA19_9_nontransformed[bootstrapped$Disease_status == disease_status]
+
+orig_quantiles <- quantile(orig_values, probs = seq(0, 1, 0.01), na.rm = TRUE)
+boot_quantiles <- quantile(boot_values, probs = seq(0, 1, 0.01), na.rm = TRUE)
+
+return(data.frame(
+  theoretical = orig_quantiles,
+  sample = boot_quantiles,
+  Disease_status = disease_status
+))
+}
+
+# Function to calculate statistics
+calculate_statistics <- function(original, bootstrapped) {
+cor_value <- cor(original, bootstrapped, use = "complete.obs")
+
+# Perform Kolmogorov-Smirnov test
+ks_test <- ks.test(original, bootstrapped)
+p_value <- ks_test$p.value
+
+return(list(correlation = cor_value, D = ks_test$statistic["D"], p_value = p_value))
+}
+
+# Function to create combined QQ plot for a specific prevalence
+plot_qq_combined <- function(prev_level, use_log = FALSE) {
+# Get one bootstrap sample
+boot_sample <- boot_list[[paste0("prev_", prev_level)]][[1]]
+
+# Combine QQ data for both disease states
+qq_data_pdac <- create_qq_data(merged_data, boot_sample, "PDAC")
+qq_data_cp <- create_qq_data(merged_data, boot_sample, "CP")
+qq_data_combined <- rbind(qq_data_pdac, qq_data_cp)
+
+# Apply log transformation if specified
+if(use_log) {
+  qq_data_combined$theoretical <- log(qq_data_combined$theoretical + 1)
+  qq_data_combined$sample <- log(qq_data_combined$sample + 1)
+  x_label <- "Original Log Quantiles"
+  y_label <- "Bootstrap Sample Log Quantiles"
+  title_prefix <- "Log "
+} else {
+  x_label <- "Original Quantiles"
+  y_label <- "Bootstrap Sample Quantiles"
+  title_prefix <- ""
+}
+
+# Calculate statistics for both disease statuses
+stats_pdac <- calculate_statistics(qq_data_pdac$theoretical, qq_data_pdac$sample)
+stats_cp <- calculate_statistics(qq_data_cp$theoretical, qq_data_cp$sample)
+
+# Create the plot
+p <- ggplot(qq_data_combined, aes(x = theoretical, y = sample, color = Disease_status)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, color = "black", linetype = "dashed") +
+  labs(title = paste0(title_prefix, "QQ Plot (Prevalence ", prev_level, "%)"),
+       x = x_label,
+       y = y_label) +
+  scale_color_manual(values = c("CP" = "#20854EFF", "PDAC" = "#BC3C29FF")) +
+  theme_publication(base_family = "sans") +
+  annotate("text", x = Inf, y = Inf, 
+           label = paste("PDAC Correlation:", round(stats_pdac$correlation, 3), 
+                         "\nPDAC D:", round(stats_pdac$D, 3),
+                         "\nPDAC p-value:", round(stats_pdac$p_value, 3)),
+           hjust = 1.1, vjust = 1.5, color = "#BC3C29FF", size = 4, fontface = "italic") +
+  annotate("text", x = Inf, y = Inf, 
+           label = paste("CP Correlation:", round(stats_cp$correlation, 3), 
+                         "\nCP D:", round(stats_cp$D, 3),
+                         "\nCP p-value:", round(stats_cp$p_value, 3)),
+           hjust = 1.1, vjust = 3.5, color = "#20854EFF", size = 4, fontface = "italic")
+
+}
+
+prevalence_to_plot <- c(1,5,10,20)
+
+# Log-transformed QQ plots
+for(prev in prevalence_to_plot) {
+p <- plot_qq_combined(prev, use_log = TRUE)
+print(p)
+ggsave(filename = paste0("results/qq_plot_prev_",prev,".pdf"),
+       plot=p,
+       width = 6, height = 4,
+       dpi= 300)
+}
+```
+
+## set up X and Y variables
+```{r}
+library(progress)
+
+if (!file.exists("results/bootstrapped_results.rds")) {
+  sink("progress_log.txt")
+  ##----------------------------------------------------------------
+  ##             detect the number of cores available             --
+  ##----------------------------------------------------------------
+  myCores = parallel::detectCores(all.tests = TRUE) - 1
+  
+  if (myCores > 20) {
+    myCores = 20
+  } else
+    myCores = myCores
+  
+  
+  memFreeG = 20
+  #Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/zulu-11.jdk")
+  ##----------------------------------------------------------------
+  ##                         initiate h2o                         --
+  ##----------------------------------------------------------------
+  h2o.init(
+    nthreads = myCores,
+    min_mem_size = paste(memFreeG, "g", sep = ""),
+    max_mem_size = paste(memFreeG, "g", sep = ""),
+    port=1234
+  )
+  h2o.no_progress()
+  
+  mets <- c("578100101", "578100121","578100133", "578100402","578100404",
+            "578100603", "578100607", "578100608","578100624",
+            "578100716","578100812","578100822")
+  
+  x_var <- c(paste0("X", mets), "CA19_9")
+  y_var <- "Disease_status"
+  
+  ## load models
+  ## CA19.9 Elastic Net model
+  x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfitCa19.9.RData")
+  model_Ca19.9 <- get(x)
+  
+  model_12mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140000.zip")
+  cutoff_12mets <- 0.6761076
+  
+  model_4mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140114.zip")
+  cutoff_4mets <- 0.773555
+  
+  results <- data_frame()
+  
+  for (l in names(boot_list)) {
+    banner(l)
+    pb <- progress_bar$new(
+  format = "[:bar] :percent",  # Only bar and percentage
+  total = 1000,
+  clear = FALSE,
+  width = 60
+)
+    list_subset <- boot_list[[l]]
+    
+    for (j in seq_along(list_subset)) {
+      data_subset <- list_subset[[j]]
+      X_val <- data_subset %>% select(all_of(x_var))
+      Y_val <- data_subset %>% select(all_of(y_var))
+      
+      X_val_Ca19.9 <- as.matrix(cbind(0, CA19_9 = data_subset[, colnames(data_subset) %in%
+                                                                "CA19_9_nontransformed"]))
+      
+      ## predict performance
+      predictionCa19.9 <- predict(model_Ca19.9,
+                                  newx = X_val_Ca19.9, s = model_Ca19.9$lambda, type = "response")
+      
+      ## add predictions
+      colnames(predictionCa19.9) <- "prediction"
+      data_subset$predictionCa19.9 <- as.vector(predictionCa19.9)
+      
+      ## calculate performance
+      perfCa19.9 <- perf.glmnet(pred = data_subset$predictionCa19.9,
+                                truth =as.factor(data_subset$Disease_status),
+                                predClass = as.factor(data_subset$predCA19_9), boot.n = 1)
+      
+      ### AUC and accuracy
+      res <- data.frame(sapply(perfCa19.9$cmResults, mean))
+      colnames(res) <- "mean"
+      res <- rbind(res, auc=mean(as.numeric(perfCa19.9$auc@y.values)))
+      #res <- rownames_to_column(res, "key")
+      res <- sjmisc::rotate_df(res, cn = FALSE)
+      res$model <- "CA19.9_only"
+      res$prevalence <- l
+      res$iteration <- j
+      
+      val_h2o <- as.h2o(cbind(X_val, Y_val))
+      
+      # Calculate performance for the 12mets model
+      res_12mets <- calculate_performance_metrics(model_12mets, val_h2o, cutoff_12mets)
+      res_12mets$model <- "12mets_signature"
+      res_12mets$prevalence <- l
+      res_12mets$iteration <- j
+      
+      # Calculate performance for the 4mets model
+      res_4mets <- calculate_performance_metrics(model_4mets, val_h2o, cutoff_4mets)
+      res_4mets$model <- "4mets_signature"
+      res_4mets$prevalence <- l
+      res_4mets$iteration <- j
+      
+      # Combine results
+      results <- rbind.fill(list(results,res, res_12mets, res_4mets))
+      pb$tick()
+    }
+  }
+  
+  saveRDS(results, "results/bootstrapped_results.rds")
+  h2o.shutdown(FALSE)
+  sink()
+}  else {
+  results <- readRDS("results/bootstrapped_results.rds")}
+
+## cummulative mean and sd of all rows
+# Calculate mean, sd, and 95% CI for each group
+
+summary_df <- results %>%
+  group_by(model, prevalence) %>%
+  dplyr::summarize(across(where(is.numeric), 
+                   list(
+                     mean = ~ mean(.),
+                     sd = ~ sd(.),
+                     ci_lower = ~ mean(.) - 1.96 * (sd(.) / sqrt(n())),
+                     ci_upper = ~ mean(.) + 1.96 * (sd(.) / sqrt(n()))
+                   ), 
+                   .names = "{col}_{fn}")) %>%
+  ungroup() %>%
+  pivot_longer(cols = -c("model", "prevalence"),
+               names_to = "variables",
+               values_to = "values") %>%
+  drop_na("values") %>%
+  mutate(variables = gsub("^mean_per_class_error", "mean-per-class-error", variables)) %>%
+  separate(variables, into = c("perf_matrix", "stats"), sep = "_", extra = "merge", fill = "right") %>%
+  pivot_wider(id_cols = c("model", "prevalence","perf_matrix"), names_from = "stats",
+              values_from = "values") %>%
+  separate(prevalence, into = c("prevalence", "perc_prev"), sep = "_", extra = "merge", fill = "right") %>%
+  mutate(perc_prev = as.numeric(perc_prev)) %>%
+  dplyr::filter(!perf_matrix %in% c("iteration","gini", "logloss",
+                                    "mean-per-class-error", "mse",
+                                    "prauc","r2", "rmse")) %>%
+  mutate(perf_matrix = factor(perf_matrix, levels = c("auc", "sensitivity", "specificity", "ppv", "npv", "accuracy"))) %>%
+  arrange(perf_matrix)
+
+p <- ggplot(summary_df,
+            aes(x=perc_prev,
+                y=mean, 
+                fill=model,
+                color=model)) +
+  geom_ribbon(aes(ymin = ci_lower, 
+                  ymax = ci_upper), 
+              alpha=0.2,
+              linetype = 2,
+              show.legend = FALSE) +
+  geom_smooth(aes(color=model),
+              ci=FALSE,
+              show.legend = TRUE) +
+  theme_bw() +
+  ylim(c(NA,1))+
+  facet_wrap(~perf_matrix, scales = "free_y", ncol=6) +
+  theme(
+    axis.line = element_line(size = 0.75),
+    axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+    ),
+    axis.title = element_text(size = 12, face = "bold")
+  ) +
+  scale_color_manual(values = rev(c("#E18727FF","#0072B5FF", "#BC3C29FF")))+
+  scale_fill_manual(values = rev(c("#E18727FF","#0072B5FF", "#BC3C29FF")))
+
+print(p)
+ 
+ggsave(filename = "results/cummulative_prevalence_perfornamce.pdf",
+       plot=p,
+       width = 9, height = 2,
+       dpi= 300)
+
+ 
+cumm_summary_df <- summary_df %>%
+  dplyr::select(model, perf_matrix, mean) %>%
+  group_by(model, perf_matrix) %>%
+  dplyr::summarize(across(where(is.numeric), 
+                   list(
+                     mean = ~ mean(.),
+                     sd = ~ sd(.),
+                     ci_lower = ~ mean(.) - 1.96 * (sd(.) / sqrt(n())),
+                     ci_upper = ~ mean(.) + 1.96 * (sd(.) / sqrt(n()))
+                   ), 
+                   .names = "{fn}")) %>%
+  ungroup() %>%
+  mutate(compiled_mean = paste0(round(mean, 3), " (", round(ci_lower, 3) , "-", round(ci_upper, 3), " )")) %>%
+  dplyr::select(model, perf_matrix, compiled_mean) %>%
+  pivot_wider(id_cols = "model", names_from = "perf_matrix", values_from = "compiled_mean")
+
+print(cumm_summary_df)
+```
+
+# Computing environment
+```{r}
+sessionInfo()
+```

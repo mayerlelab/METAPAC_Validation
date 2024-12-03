@@ -1,15 +1,20 @@
 ---
 title: "MetaPac"
+subtitle: "12 signature TASA (Predictive performance (prev = 0.2))"
 author: "_umahajan_"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_notebook:
     theme: united
-    number_sections: yes
-    toc: yes
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
     toc_depth: 4
-    toc_float: true
-subtitle: '__12 signature TASA (Predictive performance)__'
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
 ---
 
 ```{r setup, include=FALSE}
@@ -19,8 +24,16 @@ knitr::opts_chunk$set(
   tidy = TRUE,
   echo = TRUE,
   warning = FALSE,
-  message = FALSE
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
 )
+options(width = 60,
+        digits = 3,
+        scipen = 999)
 ```
 
 # Load packages and datasets
@@ -433,6 +446,7 @@ model_12mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1
 perf <- h2o.performance(model_12mets, val_h2o)
 perf
 ```
+
 ### confusion matrix
 ```{r}
 cutoff_12mets <- 0.6761076
@@ -532,22 +546,9 @@ plot <- ggplot(df,
                aes(x=fpr,
                    y=tpr,
                    color=model)) +
-  geom_line(size=2) +
-  theme_bw() +
-  theme(
-    axis.line = element_line(size = 0.75),
-    axis.text = element_text(
-      size = 11,
-      face = "bold",
-      colour = "black"
-    ),
-    axis.title = element_text(size = 12, face = "bold")
-  ) +
+  geom_line(size=1) +
+  theme_publication() +
   scale_color_manual(values = col) +
-  theme(legend.position = c(0.8, 0.2),
-        legend.background = element_blank(),
-        legend.text = element_text(size= 12, face="bold"),
-        legend.title = element_blank()) +
   labs(x="False Positive Rate",
        y="True Positive Rate")
 
@@ -556,7 +557,8 @@ print(plot)
 ggsave(filename = "results/ROC_plot_combined.pdf",
        plot=plot,
        width = 6.5, height = 5,
-       dpi= 300)
+       dpi= 300,
+       device = cairo_pdf)
 ```
 
 ## boxplot
@@ -971,6 +973,7 @@ p <- ggplot(df,
   scale_color_manual(values = c("#E18727FF","#0072B5FF")) +
   labs(x="CA19.9 level [U/ml]", y="Metabolic biomarker signature",
        shape="Disease status", color="", title = "4 Metabolite signature")
+  theme_publication()
 ## print
 print(p)
 

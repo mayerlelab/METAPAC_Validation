@@ -1,15 +1,20 @@
 ---
 title: "MetaPac"
+subtitle: "12 signature TASA (save Mojo)"
 author: "_umahajan_"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_notebook:
     theme: united
-    number_sections: yes
-    toc: yes
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
     toc_depth: 4
-    toc_float: true
-subtitle: '__12 signature TASA (save Mojo)__'
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
 ---
 
 ```{r setup, include=FALSE}
@@ -19,8 +24,16 @@ knitr::opts_chunk$set(
   tidy = TRUE,
   echo = TRUE,
   warning = FALSE,
-  message = FALSE
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
 )
+options(width = 60,
+        digits = 3,
+        scipen = 999)
 ```
 
 # Load packages and datasets

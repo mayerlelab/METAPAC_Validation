@@ -1,0 +1,750 @@
+---
+title: "MetaPac"
+subtitle: "12 signature TASA (Department specific performance)"
+author: "_umahajan_"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    theme: united
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+chooseCRANmirror(graphics = TRUE, ind = 1)
+knitr::opts_chunk$set(
+  tidy.opts = list(width.cutoff = 85),
+  tidy = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
+)
+options(width = 60,
+        digits = 3,
+        scipen = 999)
+```
+
+# Load packages and datasets
+```{r packages}
+rm(list = ls())
+##---------------------------------------------------------------
+##                      required packages                      --
+##---------------------------------------------------------------
+scriptLibraries <-  c("here",
+                      "tidyverse",
+                      "h2o",
+                      "caret",
+                      "glmnet",
+                      "Rmisc",
+                      "ROCR")
+##---------------------------------------------------------------
+##                      load functions                    --
+##---------------------------------------------------------------
+source("https://raw.githubusercontent.com/umahajanatlmu/useful_commands/main/auxillary/basicFunctions.R")
+##---------------------------------------------------------------
+##                        load packages                        --
+##---------------------------------------------------------------
+installScriptLibs(scriptLibraries)
+##---------------------------------------------------------------
+##                    set working directory                    --
+##---------------------------------------------------------------
+here::here()
+```
+
+## initiate h2o environment
+```{r}
+##----------------------------------------------------------------
+##             detect the number of cores available             --
+##----------------------------------------------------------------
+myCores = parallel::detectCores(all.tests = TRUE) - 1
+
+if (myCores > 20) {
+  myCores = 20
+} else
+  myCores = myCores
+
+
+memFreeG = 50
+#Sys.setenv(JAVA_HOME = "/Library/Java/JavaVirtualMachines/zulu-11.jdk")
+##----------------------------------------------------------------
+##                         initiate h2o                         --
+##----------------------------------------------------------------
+h2o.init(
+  nthreads = myCores,
+  min_mem_size = paste(memFreeG, "g", sep = ""),
+  max_mem_size = paste(memFreeG, "g", sep = "")
+)
+```
+## custom functions
+```{r}
+## predictions functions
+perf.glmnet <- function(truth, pred, predClass, boot.n = 1000) {
+  reps <- boot.n
+  predClass <- as.factor(predClass)
+  boot.pred <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.predClass <- matrix(0, nrow = length(truth), ncol = reps)
+  boot.truth <- matrix(0, nrow = length(truth), ncol = reps)
+  for (rep in 1:reps) {
+    bootstrap_indices <- sample(1:length(truth), length(truth), replace = TRUE)
+    boot.pred[, rep] <- pred[bootstrap_indices]
+    boot.predClass[, rep] <- predClass[bootstrap_indices]
+    boot.truth[, rep] <- truth[bootstrap_indices]
+  }
+  
+  pred.obj <- ROCR::prediction(boot.pred, boot.truth)
+  acc <- ROCR::performance(pred.obj, measure = "acc")
+  
+  cmResults <- data.frame()
+  
+  for (i in 1:ncol(boot.truth)) {
+    cm <- caret::confusionMatrix(as.factor(boot.truth[,i]), 
+                          as.factor(boot.predClass[,i]))
+    
+    cmResults[i, "accuracy"] = cm$overall['Accuracy']
+    cmResults[i, "specificity"] = cm$byClass["Specificity"]
+    cmResults[i,"sensitivity"] = cm$byClass["Sensitivity"]
+    cmResults[i, "ppv"] = cm$byClass["Pos Pred Value"]
+    cmResults[i, "npv"] = cm$byClass["Neg Pred Value"]
+    
+  }
+  
+  perf <- list(pred = pred, 
+               truth = truth, 
+               roc = ROCR::performance(pred.obj, measure = "tpr",x.measure = "fpr"), 
+               auc = ROCR::performance(pred.obj, measure = "auc"), 
+               acc = ROCR::performance(pred.obj,
+                                 measure = "acc"),
+               cmResults = cmResults
+               )
+  invisible(perf)
+  
+}
+
+## roc curves
+plotROC <- function(model.list,model.names) {
+  df <- data.frame()
+  auc <- list()
+  for (l in 1:length(model.list)) {
+    perf.roc <- model.list[[l]]$roc
+    perf.avg <- perf.roc
+    alpha.values.list <- unlist(perf.avg@alpha.values)
+    alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+    
+    alpha.values <- rev(seq(min(alpha.values.list),
+                            max(alpha.values.list),
+                            length=max(sapply(perf.avg@alpha.values, length))))
+    for (i in 1:length(perf.avg@y.values)) {
+      perf.avg@x.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]],perf.avg@x.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+      perf.avg@y.values[[i]] <-
+        stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                         rule=2, ties=mean)(alpha.values)
+    }
+    
+    x <- c(rowMeans(data.frame(perf.avg@x.values)),0)
+    y <- c(rowMeans(data.frame(perf.avg@y.values)),0)
+    
+    df_unique <- data.frame(fpr=x,
+                            tpr=y,
+                            model=model.names[l])
+    colnames(df_unique) <- c("fpr", "tpr", "model")
+    
+    df <- rbind(df, df_unique)
+    
+    ## auc
+    auc[[model.names[l]]] <- Rmisc::CI(as.numeric(model.list[[l]]$auc@y.values), ci=.95)
+  }
+  
+  col <- RColorBrewer::brewer.pal(length(unique(df$model)), "Set1")
+  plot <- ggplot(df,
+                 aes(x=fpr,
+                     y=tpr,
+                     color=model)) +
+    geom_line(size=2) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(size = 0.75),
+      axis.text = element_text(
+        size = 11,
+        face = "bold",
+        colour = "black"
+      ),
+      axis.title = element_text(size = 12, face = "bold")
+    ) +
+    scale_color_manual(values = col) +
+    theme(legend.position = c(0.8, 0.1),
+          legend.background = element_blank(),
+          legend.text = element_text(size= 12, face="bold"),
+          legend.title = element_blank()) +
+    labs(x="False Positive Rate",
+         y="True Positive Rate")
+}
+
+```
+
+
+# load TASA dataset
+```{r}
+merged_data <- readRDS("results/corrected_test_df.rds")
+```
+
+## split data as per Department speciality
+```{r}
+city_id <- read.csv("../../MetaData/metadata_final/city_id.csv", sep = ";")
+
+## prccess center data
+merged_data <- merged_data %>%
+  mutate(CENTER = as.integer(gsub('^([0-9]{2}).*', '\\1', PT))) %>%
+  left_join(city_id, by="CENTER")
+```
+
+## set up X and Y variables
+```{r}
+mets <- c("578100101", "578100121","578100133", "578100402","578100404",
+          "578100603", "578100607", "578100608","578100624",
+          "578100716","578100812","578100822") 
+
+x_var <- c(paste0("X", mets), "CA19_9")
+y_var <- "Disease_status"
+
+## load models
+model_12mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140000.zip")
+cutoff_12mets <- 0.6761076
+
+model_4mets <- h2o.upload_mojo("../../ID_VD1_VD2_models/production_models/GLM_1_AutoML_20211203_140114.zip")
+cutoff_4mets <- 0.773555
+
+
+for (dept in unique(merged_data$Department)) {
+  banner(dept)
+  
+  merged_data_subset <- merged_data[merged_data$Department %in% dept, ]
+  
+  ## split X and Y
+  X_val <- merged_data_subset %>%
+    select(all_of(x_var))
+  
+  Y_val <- merged_data_subset %>%
+    select(all_of(y_var))
+  
+  val_h2o <- as.h2o(cbind(X_val, Y_val))
+  
+  banner("CA19.9 performance")
+  
+  ## CA19.9 Elastic Net model
+  x <- load("../../../../ID_VD1_VD2_models/glmnet_models/mfitCa19.9.RData")
+  model_Ca19.9 <- get(x)
+  
+  X_val_Ca19.9 <- as.matrix(cbind(0, CA19_9 = merged_data[, colnames(merged_data_subset) %in% "CA19_9_nontransformed"]))
+  
+  ## predict performance
+  predictionCa19.9 <- predict(model_Ca19.9,
+    newx = X_val_Ca19.9, s = model_Ca19.9$lambda, type = "response")
+
+  ## add predictions
+  colnames(predictionCa19.9) <- "prediction"
+  merged_data$predictionCa19.9 <- as.vector(predictionCa19.9)
+
+  ## calculate performance
+  perfCa19.9 <- perf.glmnet(pred = merged_data$predictionCa19.9,
+                          truth =as.factor(merged_data$Disease_status),
+                          predClass = as.factor(merged_data$predCA19_9), boot.n = 100)
+
+  ### AUC and accuracy
+  auc <- Rmisc::CI(as.numeric(perfCa19.9$auc@y.values), ci=.95)
+  print(auc)
+  res <- sapply(perfCa19.9$cmResults, Rmisc::CI)
+  print(res)
+
+    ## confusion matrix
+  caret::confusionMatrix(as.factor(Y_val$Disease_status),
+                       as.factor(merged_data_subset$predCA19_9),
+                       positive = "PDAC")
+
+  ## add ROC df
+  perf.roc <- perfCa19.9$roc
+  perf.avg <- perf.roc
+
+  alpha.values.list <- unlist(perf.avg@alpha.values)
+  alpha.values.list[mapply(is.infinite, alpha.values.list)] <- 0
+
+  alpha.values <- rev(seq(min(alpha.values.list), max(alpha.values.list), length = max(sapply(perf.avg@alpha.values,
+                                                                                            length))))
+  for (i in 1:length(perf.avg@y.values)) {
+    perf.avg@x.values[[i]] <- (stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@x.values[[i]],
+                                              rule = 2, ties = mean))(alpha.values)
+    perf.avg@y.values[[i]] <- (stats::approxfun(perf.avg@alpha.values[[i]], perf.avg@y.values[[i]],
+                                              rule = 2, ties = mean))(alpha.values)
+  }
+
+  x <- c(rowMeans(data.frame(perf.avg@x.values)), 0)
+  y <- c(rowMeans(data.frame(perf.avg@y.values)), 0)
+
+  auc.Ca19.9.model <- data.frame(fpr = x, tpr = y, model = "CA19.9_only")
+
+  banner("12 met signature")
+
+  perf <- h2o.performance(model_12mets, val_h2o)
+
+  print(perf)
+
+  ## confusion matrix
+  cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_12mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), 
+                   rep(lvs, times = c(cm$CP[2],cm$PDAC[2]))), 
+                 levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+  print(cm)
+
+  ## add predictions to merged_data
+  prediction <- as.data.frame(h2o.predict(model_12mets, val_h2o))
+  merged_data_subset$prediction_12mets <- prediction$PDAC
+
+  print("10 fold cross validation")
+
+  cv.results <- data.frame()
+
+  # split data for 10 fold cross validation ------------ Create 10 equally size folds
+  folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+
+  # performance on 10 fold cross validation ----------------
+  for (i in 1:10) {
+    # Segement your data by fold using the which() function
+    Indexes <- which(folds == i, arr.ind = TRUE)
+    test.cv <- val_h2o[-Indexes, ]
+    perf.cv <- h2o.performance(model_4mets, newdata = test.cv)
+  
+    cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_12mets))
+    ## enlist categories
+    lvs <- c("CP", "PDAC")
+    ## truth
+    truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+    ## pred
+    pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), 
+                     rep(lvs, times = c(cm$CP[2],cm$PDAC[2]))), 
+                   levels = rev(lvs))
+    ## xtab
+    xtab <- table(pred, truth)
+    ## confusion matrix
+    cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+  
+    cv.results[i, 1] <- i
+    cv.results[i, 2] <- perf.cv@metrics$MSE
+    cv.results[i, 3] <- perf.cv@metrics$RMSE
+    cv.results[i, 4] <- perf.cv@metrics$r2
+    cv.results[i, 5] <- perf.cv@metrics$logloss
+    cv.results[i, 6] <- perf.cv@metrics$AUC
+    cv.results[i, 7] <- perf.cv@metrics$pr_auc
+    cv.results[i, 8] <- perf.cv@metrics$Gini
+    cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+    cv.results[i, 10] = cm$overall["Accuracy"]
+    cv.results[i, 11] = cm$byClass["Specificity"]
+    cv.results[i, 12] = cm$byClass["Sensitivity"]
+    cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+    cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+  }
+
+  colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini",
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+  cv.results.summary.12mets <-
+    cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>%
+    group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value),
+                                     min = min(value),
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+  print(knitr::kable(cv.results.summary.12mets))
+
+  ## add ROC df
+  auc.12_mets.model <- list(h2o.performance(model_12mets, newdata = val_h2o)) %>%
+    map(function(x) x %>%
+        .@metrics %>%
+        .$thresholds_and_metric_scores %>%
+        .[c("tpr", "fpr")] %>%
+        add_row(tpr = 0, fpr = 0, .before = T) %>%
+        add_row(tpr = 0, fpr = 0, .before = F)) %>%
+    map2(c("12 metabolites signature"), function(x, y) x %>%
+         add_column(model = y)) %>%
+    reduce(rbind)
+
+
+  banner("4 met signature")
+
+  perf <- h2o.performance(model_4mets, val_h2o)
+
+  print(perf)
+
+  ## confusion matrix
+  cm <- as.data.frame(h2o.confusionMatrix(perf,cutoff_4mets))
+  ## enlist categories
+  lvs <- c("CP", "PDAC")
+  ## truth
+  truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+  ## pred
+  pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), 
+                   rep(lvs, times = c(cm$CP[2],cm$PDAC[2]))), levels = rev(lvs))
+  ## xtab
+  xtab <- table(pred, truth)
+  ## confusion matrix
+  cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+  print(cm)
+
+  ## add predictions to merged_data
+  prediction <- as.data.frame(h2o.predict(model_4mets, val_h2o))
+  merged_data_subset$prediction_4mets <- prediction$PDAC
+
+  print("10 fold cross validation")
+
+  cv.results <- data.frame()
+
+  # split data for 10 fold cross validation ------------ Create 10 equally size folds
+  folds <- cut(seq(1, nrow(val_h2o)), breaks = 10, labels = FALSE)
+
+    # performance on 10 fold cross validation ----------------
+  for (i in 1:10) {
+    # Segement your data by fold using the which() function
+    Indexes <- which(folds == i, arr.ind = TRUE)
+    test.cv <- val_h2o[-Indexes, ]
+    perf.cv <- h2o.performance(model_4mets, newdata = test.cv)
+  
+    cm <- as.data.frame(h2o.confusionMatrix(perf.cv, cutoff_4mets))
+    ## enlist categories
+    lvs <- c("CP", "PDAC")
+    ## truth
+    truth <- factor(rep(lvs, times = c(cm$CP[1] + cm$PDAC[1], cm$CP[2] + cm$PDAC[2])), levels = rev(lvs))
+    ## pred
+    pred <- factor(c(rep(lvs, times = c(cm$CP[1], cm$PDAC[1])), rep(lvs, times = c(cm$CP[2],
+                                                                                 cm$PDAC[2]))), levels = rev(lvs))
+    ## xtab
+    xtab <- table(pred, truth)
+    ## confusion matrix
+    cm <- caret::confusionMatrix(xtab, positive = "PDAC")
+  
+    cv.results[i, 1] <- i
+    cv.results[i, 2] <- perf.cv@metrics$MSE
+    cv.results[i, 3] <- perf.cv@metrics$RMSE
+    cv.results[i, 4] <- perf.cv@metrics$r2
+    cv.results[i, 5] <- perf.cv@metrics$logloss
+    cv.results[i, 6] <- perf.cv@metrics$AUC
+    cv.results[i, 7] <- perf.cv@metrics$pr_auc
+    cv.results[i, 8] <- perf.cv@metrics$Gini
+    cv.results[i, 9] <- perf.cv@metrics$mean_per_class_error
+    cv.results[i, 10] = cm$overall["Accuracy"]
+    cv.results[i, 11] = cm$byClass["Specificity"]
+    cv.results[i, 12] = cm$byClass["Sensitivity"]
+    cv.results[i, 13] = cm$byClass["Pos Pred Value"]
+    cv.results[i, 14] = cm$byClass["Neg Pred Value"]
+  }
+
+  colnames(cv.results) <- c("fold", "MSE", "RMSE", "R2", "logloss", "AUC", "PRAUC", "Gini",
+                          "Mean_per_class_error", "accuracy", "specificity", "sensitivity", "ppv", "npv")
+
+  cv.results.summary.4mets <-
+    cv.results[, !colnames(cv.results) %in% "fold"] %>% gather(factor_key = TRUE) %>%
+    group_by(key) %>% dplyr::summarise(mean = mean(value), sd = sd(value), max = max(value),
+                                     min = min(value),
+                                     n  = n(),
+                                     se = sd / sqrt(n),
+                                     lower.ci = mean - qt(1 - (0.05 / 2), n - 1) * se,
+                                     upper.ci = mean + qt(1 - (0.05 / 2), n - 1) * se)
+  print(knitr::kable(cv.results.summary.4mets))
+
+  ## add ROC df
+  auc.4_mets.model <- list(h2o.performance(model_4mets, newdata = val_h2o)) %>%
+    map(function(x) x %>%
+        .@metrics %>%
+        .$thresholds_and_metric_scores %>%
+        .[c("tpr", "fpr")] %>%
+        add_row(tpr = 0, fpr = 0, .before = T) %>%
+        add_row(tpr = 0, fpr = 0, .before = F)) %>%
+    map2(c("4 metabolites signature"), function(x, y) x %>%
+         add_column(model = y)) %>%
+    reduce(rbind)
+
+
+  banner("auc")
+  ### merge all models df
+  list.df <- list(auc.Ca19.9.model, auc.12_mets.model,auc.4_mets.model)
+
+  df <- do.call(rbind, list.df)
+  col <- c("#20854EFF","#0072B5FF", "#BC3C29FF")
+  ## plot ROC
+  plot <- ggplot(df,
+               aes(x=fpr,
+                   y=tpr,
+                   color=model)) +
+    geom_line(size=2) +
+    theme_bw() +
+    theme(
+      axis.line = element_line(size = 0.75),
+      axis.text = element_text(
+        size = 11,
+        face = "bold",
+        colour = "black"
+      ),
+      axis.title = element_text(size = 12, face = "bold")
+    ) +
+    scale_color_manual(values = col) +
+    theme(legend.position = c(0.8, 0.2),
+          legend.background = element_blank(),
+          legend.text = element_text(size= 12, face="bold"),
+          legend.title = element_blank()) +
+    labs(x="False Positive Rate",
+        y="True Positive Rate")
+
+  print(plot)
+
+  ggsave(filename = paste0("results/ROC_plot_combined_department_specific_",dept,".pdf"),
+       plot=plot,
+       width = 6.5, height = 5,
+       dpi= 300)
+
+  banner("boxplot")
+
+  df <- merged_data_subset
+
+  ## plot boxplot for CA19.9
+  p <- ggplot(df,
+            aes(x= Disease_status,
+                y= CA19_9_nontransformed,
+                fill = Disease_status)) +
+    geom_violin(color="black", show.legend = FALSE, alpha = 0.5) +
+    ggbeeswarm::geom_quasirandom(shape=21,
+                               size = 1,
+                               color="black", alpha = 0.8,
+                               show.legend = FALSE,
+                               method = "pseudorandom") +
+    geom_boxplot(width=0.1, color="black", alpha=0.7,
+               show.legend = FALSE) +
+    theme_bw() +
+    geom_hline(yintercept = 37, size = 1, color = "black") +
+    ggtitle("Performance of CA19.9 alone") +
+    ggpubr::stat_compare_means(data=df,
+                             aes(x= Disease_status,
+                                 y= log10(CA19_9_nontransformed)),
+                             ref.group = "PDAC",
+                             method="t.test",
+                             label = "..p..",
+                             show.legend = FALSE) +
+    scale_y_log10() +
+    xlab("") +
+    ylab("log10(Plasma CA19.9 levels)") +
+    scale_fill_manual(values = c("#79AF97FF","#B24745FF"))
+
+  print(p)
+
+  ggsave(filename = paste0("results/boxPlot_CA19.9_alone_binary_dept_specific_",dept,".pdf"),
+       plot=p,
+       width = 3, height =4,
+       dpi= 300)
+
+  ## plot boxplot for prediction_12mets
+  p <- ggplot(df,
+            aes(x= Disease_status,
+                y= prediction_12mets,
+                fill = Disease_status)) +
+    geom_violin(color="black", show.legend = FALSE, alpha = 0.5) +
+    ggbeeswarm::geom_quasirandom(shape=21,
+                               size = 1,
+                               color="black", alpha = 0.8,
+                               show.legend = FALSE,
+                               method = "pseudorandom") +
+    geom_boxplot(width=0.1, color="black", alpha=0.7,
+               show.legend = FALSE) +
+    theme_bw() +
+    geom_hline(yintercept = cutoff_12mets, size = 1, color = "black") +
+    ggtitle("Performance of 12 Metabolite signature") +
+    ggpubr::stat_compare_means(data=df,
+                             aes(x= Disease_status,
+                                 y= prediction_12mets),
+                             ref.group = "PDAC",
+                             method="t.test",
+                             label = "..p..",
+                             show.legend = FALSE) +
+    xlab("") +
+    ylab("Metabolic biomarker signature") +
+    scale_fill_manual(values = c("#79AF97FF","#B24745FF"))
+
+  print(p)
+
+  ggsave(filename = paste0("results/boxPlot_12Mets_singature_binary_dept_specific_", dept,".pdf"),
+       plot=p,
+       width = 3, height = 4,
+       dpi= 300)
+
+  ## plot boxplot for prediction_4mets
+  p <- ggplot(df,
+            aes(x= Disease_status,
+                y= prediction_4mets,
+                fill = Disease_status)) +
+    geom_violin(color="black", show.legend = FALSE, alpha = 0.5) +
+    ggbeeswarm::geom_quasirandom(shape=21,
+                               size = 1,
+                               color="black", alpha = 0.8,
+                               show.legend = FALSE,
+                               method = "pseudorandom") +
+    geom_boxplot(width=0.1, color="black", alpha=0.7,
+               show.legend = FALSE) +
+    theme_bw() +
+    geom_hline(yintercept = cutoff_4mets, size = 1, color = "black") +
+    ggtitle("Performance of 4 Metabolite signature") +
+    ggpubr::stat_compare_means(data=df,
+                             aes(x= Disease_status,
+                                 y= prediction_4mets),
+                             ref.group = "PDAC",
+                             method="t.test",
+                             label = "..p..",
+                             show.legend = FALSE) +
+    xlab("") +
+    ylab("Metabolic biomarker signature") +
+    scale_fill_manual(values = c("#79AF97FF","#B24745FF"))
+
+  print(p)
+
+  ggsave(filename = paste0("results/boxPlot_4Mets_singature_binary_dept_specific",dept,".pdf"),
+       plot=p,
+       width = 3, height = 4,
+       dpi= 300)
+
+  table(df$Disease_status)
+
+  ## 12 mets signature
+  df$sig <- ifelse(df$predCA19_9 == "CP" &
+                   df$prediction_12mets >= cutoff_12mets &
+                   df$Disease_status =="PDAC",
+                 "Signature(+)CA19.9(-)",
+                 ifelse(df$predCA19_9 == "PDAC" & df$prediction_12mets < cutoff_12mets &
+                          df$Disease_status =="CP", "Signature(-)CA19.9(+)", NA))
+
+  table(df$sig)
+
+  p <- ggplot(df,
+            aes(x=CA19_9_nontransformed,
+                y=prediction_12mets)) +
+    geom_rect(aes(xmin = 0, xmax = 37, ymin = cutoff_12mets, ymax = Inf),
+            fill = "gray90", alpha = 0.8) +
+    geom_rect(aes(xmin = 37, xmax = Inf, ymin = -Inf, ymax = cutoff_12mets),
+            fill = "gray90", alpha = 0.8) +
+    geom_point(inherit.aes = FALSE,
+             data=subset(df, !is.na(sig)),
+             aes(x=CA19_9_nontransformed,
+                 y=prediction_12mets,
+                 color=sig),
+             shape=21,
+             fill = "white",
+             size=4,
+             stroke=1,
+             alpha=1) +
+    geom_point(aes(
+    fill=Disease_status), color="black",
+    shape=21, size=2, alpha=0.8) +
+    theme_bw() +
+    theme(
+      axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+      ),
+    axis.title = element_text(size = 12, face = "bold")
+    ) +
+    geom_hline(yintercept  = cutoff_12mets) +
+    geom_vline(xintercept = 37) +
+    scale_x_log10() +
+    scale_fill_manual(values = c("#79AF97FF","#B24745FF")) +
+    scale_color_manual(values = c("#E18727FF","#0072B5FF")) +
+    labs(x="CA19.9 level [U/ml]", y="Metabolic biomarker signature",
+        shape="Disease status", color="", title = "12 Metabolite signature")
+  ## print
+  print(p)
+
+  ggsave(filename = paste0("results/stardust_12Mets_singature_dept_specific",dept,".pdf"),
+       plot=p,
+       width = 8, height = 5,
+       dpi= 300)
+
+  ## 4 mets signature
+  df$sig <- ifelse(df$predCA19_9 == "CP" &
+                   df$prediction_4mets >= cutoff_4mets &
+                   df$Disease_status =="PDAC",
+                 "Signature(+)CA19.9(-)",
+                 ifelse(df$predCA19_9 == "PDAC" & df$prediction_4mets < cutoff_4mets &
+                          df$Disease_status =="CP", "Signature(-)CA19.9(+)", NA))
+
+  table(df$sig)
+
+  p <- ggplot(df,
+            aes(x=CA19_9_nontransformed,
+                y=prediction_4mets,
+                fill=Disease_status)) +
+    geom_rect(aes(xmin = 0, xmax = 37, ymin = cutoff_4mets, ymax = Inf),
+            fill = "gray90", alpha = 0.8) +
+    geom_rect(aes(xmin = 37, xmax = Inf, ymin = -Inf, ymax = cutoff_4mets),
+            fill = "gray90", alpha = 0.8) +
+    geom_point(inherit.aes = FALSE,
+             data=subset(df, !is.na(sig)),
+             aes(x=CA19_9_nontransformed,
+                 y=prediction_4mets,
+                 color=sig),
+             shape=21,
+             fill = "white",
+             size=4,
+             stroke=1,
+             alpha=1) +
+    geom_point(aes(
+      fill=Disease_status), color="black",
+      shape=21, size=2, alpha=0.8) +
+    theme_bw() +
+    theme(
+      axis.text = element_text(
+      size = 11,
+      face = "bold",
+      colour = "black"
+      ),
+    axis.title = element_text(size = 12, face = "bold")
+    ) +
+    geom_hline(yintercept  = cutoff_4mets) +
+    geom_vline(xintercept = 37) +
+    scale_x_log10() +
+    scale_fill_manual(values = c("#79AF97FF","#B24745FF")) +
+    scale_color_manual(values = c("#E18727FF","#0072B5FF")) +
+    labs(x="CA19.9 level [U/ml]", y="Metabolic biomarker signature",
+        shape="Disease status", color="", title = "4 Metabolite signature")
+  ## print
+  print(p)
+
+  ggsave(filename = paste0("results/stardust_4Mets_singature_dept_specific",dept,".pdf"),
+       plot=p,
+       width = 8, height = 5,
+       dpi= 300)
+
+}
+
+```
+
+# Computing environment
+```{r}
+sessionInfo()
+```

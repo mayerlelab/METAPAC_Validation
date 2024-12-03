@@ -1,15 +1,20 @@
 ---
 title: "MetaPac"
+subtitle: "12 signature TASA (Covariate Shift)"
 author: "_umahajan_"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_notebook:
     theme: united
-    number_sections: yes
-    toc: yes
+    highlight: tango
+    css: custom.css
+    number_sections: true
+    toc: true
     toc_depth: 4
-    toc_float: true
-subtitle: '__12 signature TASA (Covariate Shift)__'
+    toc_float: 
+      collapsed: false
+      smooth_scroll: true
+    code_folding: show
 ---
 
 ```{r setup, include=FALSE}
@@ -19,8 +24,16 @@ knitr::opts_chunk$set(
   tidy = TRUE,
   echo = TRUE,
   warning = FALSE,
-  message = FALSE
+  message = FALSE,
+  fig.align = "center",
+  tidy.opts = list(
+    indent = 2,          
+    width.cutoff = 60),
+  comment = "#>"
 )
+options(width = 60,
+        digits = 3,
+        scipen = 999)
 ```
 
 # Load packages and datasets
@@ -43,129 +56,7 @@ installScriptLibs(scriptLibraries)
 ##                    set working directory                    --
 ##---------------------------------------------------------------
 here::here()
-
-ifelse(!dir.exists(file.path(paste0(here()), "FINAL_RESULTS/TASA/results")), dir.create(file.path(paste0(here()), 
-    "FINAL_RESULTS/TASA/results")), FALSE)
 ```
-## impute transform scale function
-```{r}
-ImputeTransformScaleWithTrain <- function(Data,
-                                          Impute = FALSE,
-                                          Transform = FALSE,
-                                          Scaling = FALSE,
-                                          TrainData = NA,
-                                          ScaleType = c("Centering", "Auto", "Range", "Pareto", "Vast", "Level")) {
-  stopifnot(inherits(Data, "data.frame"))
-  validObject(Data)
-
-  ScaleType <- match.arg(ScaleType)
-
-  if (is.data.frame(TrainData)) {
-    TrainData <- metapacR::ImputeTransformScale(TrainData,
-                                      Impute = TRUE,
-                                      Transform = TRUE,
-                                      Scaling = FALSE)
-  }
-
-  ## subset data
-  nCol <- ncol(Data)
-  ## empty data-frame
-  scaleData <- data.frame(matrix(NA, nrow = nrow(Data), ncol = nCol))
-  ## column names to empty dataframe
-  colnames(scaleData) <- colnames(Data)
-
-  for (i in 1:nCol) {
-  ## select metabolite
-  met <- colnames(Data)[[i]]
-
-  if (class(Data[[i]]) %in% c("numeric", "integer")) {
-
-    if (Impute == TRUE) {
-      ## median of data
-      impute <- median(Data[[i]], na.rm = TRUE)
-      ## median imputation
-      Data[is.na(Data[[i]]), i] <- impute
-    }
-    if (Transform == TRUE) {
-      ## transformed data
-      Data[[i]] <- log10(Data[[i]])
-    }
-    if (Scaling == TRUE) {
-      if (is.data.frame(TrainData) && !is.null(TrainData[[met]])) {
-        ## mean of data
-        mean <- mean(TrainData[[met]], na.rm = TRUE)
-        ## min
-        min <- min(TrainData[[met]])
-        ## max
-        max <- max(TrainData[[met]])
-      } else {
-        ## mean of data
-        mean <- mean(Data[[i]], na.rm = TRUE)
-        ## min
-        min <- min(Data[[i]])
-        ## max
-        max <- max(Data[[i]])
-      }
-
-      ## centering
-      if (ScaleType == "Centering") {
-        ## centred data
-        centreData <- Data[[i]] - mean
-        ## sd data
-        sd <- sd(centreData, na.rm = TRUE)
-        
-        scaleData[[met]] <- centreData
-      }
-      ## Auto-scaling
-      else if (ScaleType == "Auto") {
-        ## centred data
-        centreData <- Data[[i]] - mean
-        ## sd data
-        sd <- sd(centreData, na.rm = TRUE)
-        
-        scaleData[[met]] <- centreData / sd
-      }
-      ## range scaling
-      else if (ScaleType == "Range") {
-        scaleData[[met]] <- (Data[[i]] - min) / (max - min)
-      }
-      ## pareto scaling
-      else if (ScaleType == "Pareto") {
-        ## centred data
-        centreData <- Data[[i]] - mean
-        ## sd data
-        sd <- sd(centreData, na.rm = TRUE)
-        
-        scaleData[[met]] <- centreData / sqrt(sd)
-      }
-      ## vast scaling
-      else if (ScaleType == "Vast") {
-        ## centred data
-        centreData <- Data[[i]] - mean
-        ## sd data
-        sd <- sd(centreData, na.rm = TRUE)
-        
-        scaleData[[met]] <- (centreData / mean) * (mean / sd)
-      }
-      ## level scaling
-      else if (ScaleType == "Level") {
-        ## centred data
-        centreData <- Data[[i]] - mean
-        ## sd data
-        sd <- sd(centreData, na.rm = TRUE)
-        
-        scaleData[[met]] <- (centreData) / mean
-      }
-    }
-  }
-
-  scaleData[[met]] <- Data[[i]]
-}
-  return(scaleData)
-}
-```
-
-
 ## load TASA metabolon dataset
 ```{r}
 metabolon_dat <- readRDS("results/merged_TASA_data.rds")
@@ -247,6 +138,8 @@ test_features <- metapacR::ImputeTransformScale(metabolon_dat,
                                         Transform = TRUE,
                                         Scaling = TRUE,
                                         ScaleType = "Auto")
+test_features$QL <- metabolon_dat$QL
+test_features$PANPA <- metabolon_dat$PANPA
 
 saveRDS(test_features, "results/uncorrected_test_df.rds")
 ```
@@ -270,7 +163,7 @@ corrected_test_df <- data.frame(matrix(ncol = length(column_names), nrow = nrow(
 colnames(corrected_test_df) <- column_names
 
 for (i in column_names) {
-  if (i  %in% c("LB01SDV__LB03", "PT", "cummulative_diagnosis", "CA19_9", "Disease_status", "predCA19_9", "LewisAg", "MH07SDV__MH16")) {
+  if (i  %in% c("LB01SDV__LB03", "PT", "cummulative_diagnosis", "CA19_9", "CA19_9_imputed","Disease_status", "predCA19_9", "LewisAg", "LewisAgNeg", "MH07SDV__MH16", "Tumor_Staging", "QL", "PANPA", "complete_case","CM3__CM11YN", "LB02__Bilirubin_µmol/l", "BilirubinCat")) {
     corrected_test_df[[i]] <- test_features[[i]]
   } else {
     banner(i)
